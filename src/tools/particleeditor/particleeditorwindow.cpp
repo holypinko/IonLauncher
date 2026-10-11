@@ -2,8 +2,7 @@
 #include "particletoolssystem.h"
 
 #include "config/profile.h"
-#include "core/tier0.h"
-#include "core/tier1.h"
+#include "tier1/interface.h"
 #include "logging/logging.h"
 #include "tier1/keyvalues.h"
 #include "util/wininfo.h"

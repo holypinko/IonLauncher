@@ -1,6 +1,6 @@
 #include "engine/lowlatency.h"
-#include "core/tier0.h"
-#include "core/tier1.h"
+#include "tier0/commandline.h"
+#include "tier1/interface.h"
 #include "geforce/reflex.h"
 #include "materialsystem/cmaterialsystem.h"
 #include "materialsystem/cmatqueuedrendercontext.h"

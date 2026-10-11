@@ -1,11 +1,10 @@
 #include "tier1/convar.h"
 #include "sourceconsole.h"
-#include "core/tier1.h"
-#include "core/convar/concommand.h"
+#include "tier1/interface.h"
 #include "util/printcommands.h"
 #include "engine/client/clientstate.h"
 #include "tier0/module.h"
-#include <core/tier0.h>
+#include "tier0/commandline.h"
 
 CGameConsole* g_pGameConsole;
 

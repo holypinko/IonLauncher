@@ -1,10 +1,47 @@
 #include "mod.h"
 #include "modmanager.h"
-#include "core/convar/convar.h"
+#include "tier1/convar.h"
 #include "modsystem/platform/modplatform.h"
 #include "rapidjson/error/en.h"
 
 #include <algorithm>
+#include <sstream>
+
+static int ParseConVarFlagsString(std::string modName, std::string sFlags)
+{
+	int iFlags = 0;
+	std::stringstream stFlags(sFlags);
+	std::string sFlag;
+
+	while (std::getline(stFlags, sFlag, '|'))
+	{
+		// trim the flag
+		sFlag.erase(sFlag.find_last_not_of(" \t\n\f\v\r") + 1);
+		sFlag.erase(0, sFlag.find_first_not_of(" \t\n\f\v\r"));
+
+		// skip if empty
+		if (sFlag.empty())
+			continue;
+
+		// find the matching flag value
+		bool ok = false;
+		for (const auto& flagPair : GetConVarFlagNames())
+		{
+			if (sFlag == flagPair.second)
+			{
+				iFlags |= flagPair.first;
+				ok = true;
+				break;
+			}
+		}
+		if (!ok)
+		{
+			spdlog::warn("Mod ConCommand {} has unknown flag {}", modName, sFlag);
+		}
+	}
+
+	return iFlags;
+}
 
 ModSource Mod::ResolveModSourceFromPath(const fs::path& modDir)
 {

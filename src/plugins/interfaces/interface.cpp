@@ -1,5 +1,4 @@
 #include <string.h>
-#include "core/tier1.h"
 #include "interface_registry.h"
 
 InterfaceReg* s_pInterfaceRegs;

@@ -1,13 +1,12 @@
 #include "printmaps.h"
 #include "tier1/convar.h"
-#include "core/convar/concommand.h"
 #include "tier1/cvar.h"
 #include "modsystem/modmanager.h"
-#include "core/tier0.h"
-#include "engine/r2engine.h"
+#include "engine/server/sv_main.h"
+#include "engine/sys_dll.h"
 #include "engine/server/server.h"
 #include "vscript/languages/squirrel_re/squirrel.h"
-#include "client/connect.h"
+#include "engine/client/connection_manager.h"
 #include "dedicated/dedicated.h"
 
 #include <filesystem>

@@ -1,4 +1,3 @@
-#include "core/tier1.h"
 #include "plugins/interfaces/interface_registry.h"
 #include "ISys.h"
 #include "plugins/plugins.h"

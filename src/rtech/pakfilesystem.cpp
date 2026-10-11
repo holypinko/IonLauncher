@@ -1,5 +1,5 @@
 #include "pakfilesystem.h"
-#include "core/tier0.h"
+#include "tier0/commandline.h"
 #include "dedicated/dedicated.h"
 #include "modsystem/modmanager.h"
 #include "rtech/pakstate.h"
@@ -7,6 +7,7 @@
 #include "util/utils.h"
 #include <algorithm>
 #include <mutex>
+#include <functional>
 
 DECLARE_MODULE(PakFilesystemHooks)
 
@@ -156,7 +157,7 @@ void PakLoadManager::TrackModPaks(Mod& mod)
         ModPak_t pak;
         pak.m_modName = mod.Name;
         pak.m_path = (modPakPath / modRpakEntry.m_pakName).string();
-        pak.m_pathHash = STR_HASH(pak.m_path);
+        pak.m_pathHash = std::hash<std::string>()(pak.m_path);
 
         pak.m_preload = modRpakEntry.m_preload;
         pak.m_dependentPakHash = modRpakEntry.m_dependentPakHash;
@@ -488,7 +489,7 @@ void PakLoadManager::LoadDependentPaks(const std::string& path, PakHandle_t hand
     ++m_reentranceCounter;
     const ScopeGuard guard([&]() { --m_reentranceCounter; });
 
-    const size_t hash = STR_HASH(path);
+    const size_t hash = std::hash<std::string>()(path);
     for (auto& modPak : m_modPaks)
     {
         if (modPak.m_markedForDelete || modPak.m_dependentPakHash != hash)
@@ -833,7 +834,7 @@ DECLARE_HOOK(Pak_OpenFile, rtech_game.DLL + 0x1E20, [](auto& hook, const char* p
             // remove the r2\ from the start used for path lookups
             std::string starpakPath = path.string().substr(3);
             // hash the starpakPath to compare with stored entries
-            size_t hashed = STR_HASH(starpakPath);
+            size_t hashed = std::hash<std::string>()(starpakPath);
 
             // loop through all loaded mods
             for (Mod& mod : g_pModManager->m_LoadedMods)

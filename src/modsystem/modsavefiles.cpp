@@ -9,9 +9,9 @@
 #include "rapidjson/writer.h"
 #include "rapidjson/stringbuffer.h"
 #include "config/profile.h"
-#include "core/tier0.h"
+#include "tier0/commandline.h"
 #include "rapidjson/error/en.h"
-#include "vscript/scripts/scriptjson.h"
+#include "game/shared/vscript_shared.h"
 
 SaveFileManager* g_pSaveFileManager;
 int MAX_FOLDER_SIZE = 52428800; // 50MB (50 * 1024 * 1024)

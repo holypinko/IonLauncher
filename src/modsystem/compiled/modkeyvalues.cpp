@@ -1,4 +1,5 @@
-#include "core/filesystem/filesystem.h"
+#include "filesystem/basefilesystem.h"
+#include "modsystem/modfilesystem.h"
 #include "modsystem/modmanager.h"
 #include "tier1/keyvalues.h"
 

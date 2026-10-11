@@ -1,12 +1,11 @@
 #include "modmanager.h"
 #include "config/profile.h"
-#include "core/convar/concommand.h"
-#include "core/filesystem/filesystem.h"
+#include "tier1/convar.h"
+#include "modsystem/modfilesystem.h"
 #include "datacache/mdlcache.h"
 #include "dedicated/dedicated.h"
 #include "engine/gl_model_private.h"
 #include "engine/modelloader.h"
-#include "engine/r2engine.h"
 #include "masterserver/masterserver.h"
 #include "miles/audio.h"
 #include "modsystem/modatlas.h"
@@ -19,7 +18,6 @@
 #include "rtech/pakstate.h"
 #include "tier0/frametask.h"
 #include "tier0/module.h"
-#include "tier1/convar.h"
 #include "tier1/cvar.h"
 #include "util/utils.h"
 #include "vpklib/packedstore.h"
@@ -35,6 +33,7 @@
 #include <limits>
 #include <new>
 #include <sstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -129,11 +128,11 @@ ModManager::ModManager(const CModule& engineModule)
 
     // precaculated string hashes
     // note: use backslashes for these, since we use lexically_normal for file paths which uses them
-    m_hScriptsRsonHash = STR_HASH("scripts\\vscripts\\scripts.rson");
+    m_hScriptsRsonHash = std::hash<std::string>()("scripts\\vscripts\\scripts.rson");
     m_hPdefHash =
-        STR_HASH("cfg\\server\\persistent_player_data_version_231.pdef" // this can have multiple versions, but we use 231 so that's what we hash
+        std::hash<std::string>()("cfg\\server\\persistent_player_data_version_231.pdef" // this can have multiple versions, but we use 231 so that's what we hash
         );
-    m_hKBActHash = STR_HASH("scripts\\kb_act.lst");
+    m_hKBActHash = std::hash<std::string>()("scripts\\kb_act.lst");
 
     g_pModDownloader->LoadServerModSchema();
 
@@ -562,7 +561,7 @@ void ModManager::LoadMods()
                         // postload things
                         if (dRpakJson.HasMember("Postload") && dRpakJson["Postload"].IsObject() && dRpakJson["Postload"].HasMember(pakName))
                         {
-                            modPak.m_dependentPakHash = STR_HASH(dRpakJson["Postload"][pakName].GetString());
+                            modPak.m_dependentPakHash = std::hash<std::string>()(dRpakJson["Postload"][pakName].GetString());
 
                             // only one load method can be used for an rpak.
                             goto REGISTER_STARPAK;
@@ -624,7 +623,7 @@ void ModManager::LoadMods()
                             // only add the string we are making if it isnt empty
                             if (!str.empty())
                             {
-                                mod.StarpakPaths.push_back(STR_HASH(str));
+                                mod.StarpakPaths.push_back(std::hash<std::string>()(str));
                                 spdlog::info("Mod {} registered starpak '{}'", mod.Name, str);
                                 str = "";
                             }
@@ -657,7 +656,7 @@ void ModManager::LoadMods()
                     if (fs::is_regular_file(file))
                     {
                         std::string kvStr = g_pModManager->NormaliseModFilePath(file.path().lexically_relative(mod.m_ModDirectory / "keyvalues"));
-                        mod.KeyValues.emplace(STR_HASH(kvStr), kvStr);
+                        mod.KeyValues.emplace(std::hash<std::string>()(kvStr), kvStr);
                     }
                 }
             }
@@ -1629,7 +1628,7 @@ bool ModManager::GetModVPKModelSource(const fs::path& path, std::string& vpkPath
 void ModManager::CompileAssetsForFile(const char* filename)
 {
     const std::string normalisedPath = NormaliseModFilePath(fs::path(filename));
-    const size_t fileHash = STR_HASH(normalisedPath);
+    const size_t fileHash = std::hash<std::string>()(normalisedPath);
 
     if (fileHash == m_hScriptsRsonHash)
         BuildScriptsRson();

@@ -1,0 +1,36 @@
+#include "engine/demo.h"
+#include "tier1/convar.h"
+#include "tier1/cvar.h"
+ON_DLL_LOAD_CLIENT("engine.dll", EngineDemoFixes, [](CModule module)
+{
+	// allow demo recording on loopback
+	module.Offset(0x8E1B1).NoOP(2);
+	module.Offset(0x56CC3).NoOP(2);
+})
+
+ON_DLL_LOAD_CLIENT_RELIESON("client.dll", ClientDemoFixes, ConVar, [](CModule module)
+{
+	// change default values of demo cvars to enable them by default, but not autorecord
+	// this is before Host_Init, the setvalue calls here will get overwritten by custom cfgs/launch options
+	ConVar* Cvar_demo_enableDemos = g_pCVar->FindVar("demo_enabledemos");
+	Cvar_demo_enableDemos->m_pszDefaultValue = "1";
+	Cvar_demo_enableDemos->SetValue(true);
+
+	ConVar* Cvar_demo_writeLocalFile = g_pCVar->FindVar("demo_writeLocalFile");
+	Cvar_demo_writeLocalFile->m_pszDefaultValue = "1";
+	Cvar_demo_writeLocalFile->SetValue(true);
+
+	ConVar* Cvar_demo_autoRecord = g_pCVar->FindVar("demo_autoRecord");
+	Cvar_demo_autoRecord->AddFlags(FCVAR_ARCHIVE_PLAYERPROFILE);
+	Cvar_demo_autoRecord->m_pszDefaultValue = "0";
+	Cvar_demo_autoRecord->SetValue(false);
+})
+
+CDemoPlayer* g_pDemoPlayer;
+IDemoRecorder* g_pDemoRecorder;
+
+ON_DLL_LOAD_RELIESON("engine.dll", Demo, ConVar, [](CModule module)
+{
+	g_pDemoPlayer = module.Offset(0xFD15A90).RCast<CDemoPlayer*>();
+	g_pDemoRecorder = module.Offset(0x763D80).RCast<IDemoRecorder*>();
+})

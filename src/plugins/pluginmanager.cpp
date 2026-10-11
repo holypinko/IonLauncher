@@ -3,7 +3,7 @@
 #include <ranges>
 #include "plugins.h"
 #include "config/profile.h"
-#include "core/convar/concommand.h"
+#include "tier1/convar.h"
 
 namespace fs = std::filesystem;
 

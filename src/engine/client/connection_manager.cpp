@@ -1,0 +1,1292 @@
+#include "engine/client/connection_manager.h"
+#include "common/proto_oob.h"
+#include "tier1/convar.h"
+#include "tier0/commandline.h"
+#include "tier0/platform.h"
+#include "dedicated/dedicated.h"
+#include "engine/client/cdll_engine_int.h"
+#include "engine/client/clientstate.h"
+#include "engine/cmd.h"
+#include "tier1/convar.h"
+#include "tier1/bitbuf.h"
+#include "common/netmessages.h"
+#include "masterserver/masterserver.h"
+#include "modsystem/modmanager.h"
+#include "engine/server/serverauthentication.h"
+#include "tier0/frametask.h"
+#include "tier0/vanilla.h"
+#include "tier1/cvar.h"
+#include "util/utils.h"
+#include "vscript/languages/squirrel_re/squirrel.h"
+#include "engine/playlists.h"
+
+#include <algorithm>
+
+DECLARE_MODULE(ConnectHooks)
+
+void(__fastcall* SCR_BeginLoadingPlaque)(const char* levelName) = nullptr;
+void(__fastcall* SCR_EndLoadingPlaque)() = nullptr;
+
+bool g_bConnectingToServer = false;
+bool g_bRetryingConnection = false;
+
+ConnectionManager* g_pConnectionManager = nullptr;
+
+ConVar* Cvar_cl_resend_inforequest_timeout = nullptr;
+ConVar* Cvar_cl_resend_inforequest_timeout_remote = nullptr;
+ConVar* Cvar_cl_resend_inforequest_interval_ms = nullptr;
+ConVar* Cvar_cl_unload_remote_mods_on_matchmaking = nullptr;
+
+void ConnectionManager::SetPendingMap(std::string mapName)
+{
+	std::scoped_lock lock(m_MapLoadMutex);
+	m_szMapName = std::move(mapName);
+	m_bMapLoadAuthorized = false;
+}
+
+void ConnectionManager::ClearPendingMap()
+{
+	std::scoped_lock lock(m_MapLoadMutex);
+	m_szMapName.clear();
+	m_bMapLoadAuthorized = false;
+}
+
+// i don't like this honestly
+bool ConnectionManager::DeferMapLoad(std::string_view mapName)
+{
+	if (!IsConnecting())
+		return false;
+
+	std::scoped_lock lock(m_MapLoadMutex);
+	if (!IsConnecting())
+		return false;
+
+	if (m_bMapLoadAuthorized && mapName == m_szMapName)
+	{
+		m_bMapLoadAuthorized = false;
+		return false;
+	}
+
+	if (!m_bMapLoadAuthorized)
+		m_szMapName = mapName;
+
+	return true;
+}
+
+void ConnectionManager::Connect(bool useSCRPlaque, std::string mapName)
+{
+	const char* mp_gamemode = g_pCVar->FindVar("mp_gamemode") ? g_pCVar->FindVar("mp_gamemode")->GetString() : "";
+	bool isSolo = (strcmp(mp_gamemode, "solo") == 0);
+	m_bSolo = isSolo;
+
+	if (useSCRPlaque && !isSolo)
+		SCR_BeginLoadingPlaque(nullptr);
+
+	if (IsConnecting())
+		return;
+
+	ResetState();
+
+	SetPendingMap(std::move(mapName));
+	m_bUseSCRPlaque = useSCRPlaque;
+	m_eLastMode = m_eCurrentMode;
+	m_eCurrentMode = eConnectionMode::LocalServer;
+	m_bConnecting.store(true, std::memory_order_release);
+
+	InvokeConnectionStartCallbacks();
+
+	ConnectToLocalServer();
+}
+
+void ConnectionManager::Connect(const std::string& address, const std::string& password, bool useSCRPlaque, std::string mapName)
+{
+	const char* mp_gamemode = g_pCVar->FindVar("mp_gamemode") ? g_pCVar->FindVar("mp_gamemode")->GetString() : "";
+	bool isSolo = (strcmp(mp_gamemode, "solo") == 0);
+	m_bSolo = isSolo;
+
+	if (useSCRPlaque && !isSolo)
+		SCR_BeginLoadingPlaque(nullptr);
+
+	if (IsConnecting())
+		return;
+
+	ResetState();
+
+	SetPendingMap(std::move(mapName));
+	m_bUseSCRPlaque = useSCRPlaque;
+	m_eLastMode = m_eCurrentMode;
+	m_eCurrentMode = eConnectionMode::RemoteServer;
+	m_bConnecting.store(true, std::memory_order_release);
+	m_szLastServerID = address;
+	m_szLastServerPassword = password;
+
+	InvokeConnectionStartCallbacks();
+
+	ConnectToRemoteServer(address, password);
+}
+
+void ConnectionManager::Connect(const std::string& address, ConnectionManager::eConnectionMode mode, bool useSCRPlaque, std::string mapName)
+{
+	const char* mp_gamemode = g_pCVar->FindVar("mp_gamemode") ? g_pCVar->FindVar("mp_gamemode")->GetString() : "";
+	bool isSolo = (strcmp(mp_gamemode, "solo") == 0);
+	m_bSolo = isSolo;
+
+	if (useSCRPlaque && !isSolo)
+		SCR_BeginLoadingPlaque(nullptr);
+
+	if (IsConnecting())
+		return;
+
+	ResetState();
+
+	SetPendingMap(std::move(mapName));
+	m_bUseSCRPlaque = useSCRPlaque;
+	m_eLastMode = m_eCurrentMode;
+	m_eCurrentMode = mode;
+	m_bConnecting.store(true, std::memory_order_release);
+
+	InvokeConnectionStartCallbacks();
+
+	switch (mode)
+	{
+	case eConnectionMode::LocalServer:
+		ConnectToLocalServer();
+		break;
+	case eConnectionMode::RemoteServer:
+		ConnectToRemoteServer(m_szLastServerID, m_szLastServerPassword);
+		break;
+	case eConnectionMode::P2P:
+		ConnectToP2PServer(address);
+		break;
+	case eConnectionMode::Direct:
+		ConnectToDirectServer(address);
+		break;
+	default:
+		Interrupt("Unknown connection mode");
+		break;
+	}
+}
+
+void ConnectionManager::InvokeConnectionStartCallbacks()
+{
+	bool scriptManagedLoading = !m_bUseSCRPlaque && !m_bSolo;
+
+	g_pSquirrel[ScriptContext::UI]->AsyncCall("NSUICodeCallback_ConnectionStarted", scriptManagedLoading);
+}
+
+void ConnectionManager::InvokeConnectionMessageCallbacks(const std::string& message)
+{
+	g_pSquirrel[ScriptContext::UI]->AsyncCall("NSUICodeCallback_ConnectionMessage", message.c_str());
+}
+
+void ConnectionManager::InvokeConnectionStoppedCallbacks(std::string reason)
+{
+	g_pSquirrel[ScriptContext::UI]->AsyncCall("NSUICodeCallback_ConnectionStopped", reason.c_str());
+}
+
+bool ConnectionManager::ParseAddress(const std::string& address, std::string& ip, int& port, bool& isV6)
+{
+	ip.clear();
+	port = -1;
+	isV6 = false;
+
+	std::string s = address;
+
+	// trim
+	const auto begin = s.find_first_not_of(" \t");
+	if (begin == std::string::npos)
+		return false;
+	const auto end = s.find_last_not_of(" \t");
+	s = s.substr(begin, end - begin + 1);
+
+	if (s.empty())
+		return false;
+
+	auto parsePort = [&](const std::string& portStr)
+	{
+		if (portStr.empty())
+			return;
+
+		try
+		{
+			size_t consumed = 0;
+			const int parsed = std::stoi(portStr, &consumed);
+			if (consumed == portStr.size() && parsed >= 1 && parsed <= 65535)
+				port = parsed;
+			else
+				port = -1;
+		}
+		catch (...)
+		{
+			port = -1;
+		}
+	};
+
+	// [v6] or [v6]:port
+	if (s.front() == '[')
+	{
+		const auto close = s.find(']');
+		if (close == std::string::npos)
+			return false;
+
+		ip = s.substr(1, close - 1);
+
+		if (close + 1 < s.size() && s[close + 1] == ':')
+			parsePort(s.substr(close + 2));
+	}
+	else
+	{
+		// host:port (single ':') OR bare v6 / v4 / domain
+		const auto firstColon = s.find(':');
+		const auto lastColon = s.rfind(':');
+
+		if (firstColon != std::string::npos && firstColon == lastColon)
+		{
+			ip = s.substr(0, firstColon);
+			parsePort(s.substr(firstColon + 1));
+		}
+		else
+		{
+			ip = s;
+		}
+	}
+
+	if (ip.empty())
+		return false;
+
+	// Decide if it's real IPv6. Treat ::ffff:a.b.c.d as IPv4 (not v6).
+	if (ip.find(':') != std::string::npos)
+	{
+		const std::string prefix = "::ffff:";
+		if (ip.rfind(prefix, 0) == 0)
+		{
+			std::string rest = ip.substr(prefix.size());
+			if (!(rest.find('.') != std::string::npos && rest.find(':') == std::string::npos))
+				isV6 = true;
+		}
+		else
+		{
+			isV6 = true;
+		}
+	}
+
+	return true;
+}
+
+ConnectionManager::eConnectionMode ConnectionManager::DetermineModeFromAddress(const std::string& address)
+{
+	if (address.find("localhost") != std::string::npos)
+		return eConnectionMode::LocalServer;
+
+	std::string ip;
+	int port;
+	bool isV6;
+
+	if (!ParseAddress(address, ip, port, isV6))
+		return eConnectionMode::Direct;
+
+	if (isV6)
+		return eConnectionMode::P2P;
+
+	return eConnectionMode::Direct;
+}
+
+void ConnectionManager::AuthenticateToMasterServer()
+{
+	auto authDone = []()
+	{
+		return g_pMasterServerManager->m_bOriginAuthWithMasterServerDone.load(std::memory_order_acquire);
+	};
+
+	if (!authDone())
+	{
+		int agreedToSendToken = g_pCVar->FindVar("ns_has_agreed_to_send_token")->GetInt();
+		if (agreedToSendToken != AGREED_TO_SEND_TOKEN)
+		{
+			Interrupt("#AUTHENTICATION_FAILED_BODY");
+			return;
+		}
+
+		UpdateMessage("#DIALOG_AUTHENTICATING_MASTERSERVER");
+
+		// if you run +map you can start-up before authing really annoying
+        if (!g_pEngineClient->IsOriginAuthenticated())
+        {
+            spdlog::info("Waiting for Origin authentication before connecting");
+            while (!IsCancelled() && !g_pEngineClient->IsOriginAuthenticated())
+                Sleep(100);
+
+            RETURN_IF_CANCELLED()
+        }
+
+        RETURN_IF_CANCELLED()
+
+        float startTime = g_PlatFloatTime();
+		float timeOut = g_pCVar->FindVar("cl_resend_timeout")->GetFloat();
+
+		g_pMasterServerManager->AuthenticateOriginWithMasterServer();
+
+		while (!authDone() && g_PlatFloatTime() - startTime < timeOut && !IsCancelled())
+			Sleep(100);
+	}
+
+	RETURN_IF_CANCELLED()
+
+	UpdateMessage();
+
+	if (!authDone() || !g_pMasterServerManager->m_bOriginAuthWithMasterServerSuccessful.load(std::memory_order_acquire))
+	{
+		Interrupt("#AUTHENTICATION_FAILED_BODY");
+		return;
+	}
+
+	spdlog::info("Successfully authenticated with master server for origin auth");
+}
+
+void ConnectionManager::SendInfoRequestPacket(const CNetAdr& addr, bool serverAuthUs, bool requestMods)
+{
+	g_bReceivedServerInfo.store(false, std::memory_order_release);
+	if (serverAuthUs)
+		g_bReceivedAuthNotify.store(false, std::memory_order_release);
+
+	char buffer[256];
+	bf_write msg(buffer, sizeof(buffer));
+	msg.WriteLong(CONNECTIONLESS_HEADER);
+	msg.WriteChar(A2S_REQUESTCUSTOMSERVERINFO);
+	msg.WriteLong(CUSTOMSERVERINFO_VERSION);
+	msg.WriteByte(requestMods);
+	msg.WriteLong(MODDOWNLOADINFO_VERSION);
+	msg.WriteByte(serverAuthUs);
+
+	if (serverAuthUs)
+	{
+		msg.WriteString(g_pLocalPlayerUserID);
+		msg.WriteString(g_pMasterServerManager->m_sOwnClientAuthToken);
+	}
+
+	NET_SendPacket(nullptr, NS_CLIENT, &addr, msg.GetData(), msg.GetNumBytesWritten(), nullptr, false, 0, true);
+
+	float startTime = g_PlatFloatTime();
+	float timeOut = g_pCVar->FindVar("cl_resend_inforequest_timeout")->GetFloat();
+
+	if (m_eCurrentMode == eConnectionMode::RemoteServer)
+		timeOut = g_pCVar->FindVar("cl_resend_inforequest_timeout_remote")->GetFloat();
+
+	UpdateMessage("#REQUESTING_CUSTOM_SERVER_INFO");
+
+	while (!g_bReceivedServerInfo.load(std::memory_order_acquire) && !IsCancelled() && g_PlatFloatTime() - startTime < timeOut)
+	{
+		int retryInterval = g_pCVar->FindVar("cl_resend_inforequest_interval_ms")->GetInt();
+		NET_SendPacket(nullptr, NS_CLIENT, &addr, msg.GetData(), msg.GetNumBytesWritten(), nullptr, false, 0, true);
+		Sleep(retryInterval);
+	}
+
+	startTime = g_PlatFloatTime();
+
+	if (serverAuthUs)
+	{
+		while (!g_bReceivedAuthNotify.load(std::memory_order_acquire) && g_PlatFloatTime() - startTime < timeOut && !IsCancelled())
+			Sleep(100);
+
+		RETURN_IF_CANCELLED()
+
+		if (!g_bReceivedAuthNotify.load(std::memory_order_acquire))
+			Interrupt("#AUTHENTICATION_FAILED_BODY");
+	}
+}
+
+void ConnectionManager::RequestServerModInfo(const CNetAdr& addr, bool serverAuthUs)
+{
+    g_pModDownloader->BeginServerModInfoRequest();
+    SendInfoRequestPacket(addr, serverAuthUs, true);
+
+    const float startTime = g_PlatFloatTime();
+    const float timeout = g_pModDownloader->GetServerModInfoTimeoutSeconds();
+    while (g_pModDownloader->IsListeningForServerMods() && !IsCancelled() && g_PlatFloatTime() - startTime < timeout)
+        Sleep(50);
+
+    g_pModDownloader->StopServerModInfoRequest();
+}
+
+std::vector<RemoteModInfo> ConnectionManager::MergeOptionalServerRequirements(std::vector<RemoteModInfo> requiredMods)
+{
+    for (const ModDownloader::modentry_s& serverMod : g_pModDownloader->GetServerRequestedMods())
+    {
+        if (!serverMod.optionalRequiredOnClient)
+            continue;
+
+        const auto existing = std::find_if(requiredMods.begin(), requiredMods.end(), [&serverMod](const RemoteModInfo& required)
+        { return required.Name == serverMod.name && required.Version == serverMod.version; });
+        if (existing == requiredMods.end())
+        {
+            spdlog::info("Treating server mod {} v{} as an optional client requirement", serverMod.name, serverMod.version);
+            requiredMods.push_back({serverMod.name, serverMod.version});
+        }
+    }
+    return requiredMods;
+}
+
+void ConnectionManager::PrepareServerModsAndConnect(const CNetAdr& addr, bool serverAuthUs, std::vector<RemoteModInfo> requiredMods,
+                                                    bool disableUnrequiredMods, std::string address, std::string serverName)
+{
+    if (!g_pCVar->FindVar("allow_mod_auto_download")->GetBool())
+    {
+        if (serverAuthUs)
+        {
+            SendInfoRequestPacket(addr, true, false);
+            RETURN_IF_CANCELLED()
+        }
+        FinaliseJoiningServer(address);
+        return;
+    }
+
+    RequestServerModInfo(addr, serverAuthUs);
+    RETURN_IF_CANCELLED()
+
+    requiredMods = MergeOptionalServerRequirements(std::move(requiredMods));
+    const bool needsDownload = std::any_of(requiredMods.begin(), requiredMods.end(),
+                                           [](const RemoteModInfo& required) { return !HasRequiredModVersion(required.Name, required.Version); });
+    if (needsDownload)
+    {
+        UpdateMessage("#MANIFEST_FETCHING_TEXT");
+        g_pModDownloader->FetchModsListFromAPI();
+
+        while (g_pModDownloader->modState.state == ModDownloader::MANIFEST_FETCHING && !IsCancelled())
+            Sleep(100);
+
+        RETURN_IF_CANCELLED()
+    }
+
+    if (serverName.empty())
+        serverName = g_szLastServerInfoName;
+    DownloadMods(requiredMods, serverName);
+    RETURN_IF_CANCELLED()
+
+    ReloadModsAndConnect(std::move(requiredMods), std::move(address), disableUnrequiredMods);
+}
+
+bool ConnectionManager::HasRequiredModVersion(std::string_view name, std::string_view version)
+{
+	for (const Mod& existingMod : g_pModManager->m_LoadedMods)
+	{
+		if (existingMod.Name == name && (existingMod.IsCoreMod() || existingMod.Version == version))
+			return true;
+	}
+	return false;
+}
+
+void ConnectionManager::DownloadMods(const std::vector<RemoteModInfo>& requiredMods, const std::string& serverName)
+{
+	const std::vector<ModDownloader::modentry_s> serverDownloads = g_pModDownloader->GetServerRequestedMods();
+	std::vector<ModDownloader::modentry_s> unverifiedModsToDownload;
+	bool needToDownloadMods = false;
+
+	UpdateMessage("#CHECKING_REQUIRED_MODS");
+
+    for (const RemoteModInfo& mod : requiredMods)
+    {
+		if (HasRequiredModVersion(mod.Name, mod.Version))
+			continue;
+
+		needToDownloadMods = true;
+
+		const auto advertisedDownload = std::find_if(
+			serverDownloads.begin(),
+			serverDownloads.end(),
+			[&mod](const ModDownloader::modentry_s& download)
+			{
+				return download.name == mod.Name && download.version == mod.Version;
+			});
+		if (advertisedDownload != serverDownloads.end())
+		{
+			unverifiedModsToDownload.push_back(*advertisedDownload);
+			continue;
+		}
+
+		if (!g_pModDownloader->IsModAuthorized(mod.Name, mod.Version))
+		{
+			Interrupt(fmt::format(
+				"{}\n{}",
+				Localize("#MISSING_MOD", mod.Name.c_str(), mod.Version.c_str(), static_cast<const char*>(nullptr)),
+				Localize("#MOD_NOT_VERIFIED", static_cast<const char*>(nullptr))));
+			return;
+		}
+	}
+
+	if (!needToDownloadMods)
+		return;
+
+	if (!unverifiedModsToDownload.empty())
+	{
+        if (!g_pModDownloader->NotifyConfirmDownloadMods(static_cast<int>(unverifiedModsToDownload.size()), serverName.c_str()))
+        {
+			const ModDownloader::modentry_s& mod = unverifiedModsToDownload.front();
+			Interrupt(fmt::format(
+				"{}\n{}",
+				Localize("#MISSING_MOD", mod.name.c_str(), mod.version.c_str(), static_cast<const char*>(nullptr)),
+				Localize("#MOD_NOT_VERIFIED", static_cast<const char*>(nullptr))));
+			return;
+		}
+		while (m_eModAcceptState.load(std::memory_order_acquire) == eModAcceptState::NOT_DECIDED && !IsCancelled())
+			Sleep(100);
+
+		if (m_eModAcceptState.load(std::memory_order_acquire) == eModAcceptState::DENIED)
+			Interrupt();
+
+		RETURN_IF_CANCELLED()
+	}
+
+	std::vector<WorkshopSelection> workshopSelections;
+	for (const ModDownloader::modentry_s& mod : unverifiedModsToDownload)
+	{
+		const std::optional<ModDownloader::ModWorkshopAlternative> alternative = g_pModDownloader->FindModWorkshopAlternative(mod);
+		if (!alternative)
+			continue;
+
+		g_pModDownloader->ResetDownloadSourceChoice();
+		if (!g_pModDownloader->NotifyChooseDownloadSource(mod, *alternative))
+			continue;
+		while (g_pModDownloader->GetDownloadSourceChoice() == ModDownloader::ModDownloadSourceChoice::NotDecided && !IsCancelled())
+			Sleep(100);
+
+		if (g_pModDownloader->GetDownloadSourceChoice() == ModDownloader::ModDownloadSourceChoice::Cancelled)
+			Interrupt();
+		RETURN_IF_CANCELLED()
+
+		if (g_pModDownloader->GetDownloadSourceChoice() == ModDownloader::ModDownloadSourceChoice::ModWorkshop)
+			workshopSelections.push_back({mod.name, mod.version, *alternative});
+	}
+
+    for (const RemoteModInfo& mod : requiredMods)
+    {
+		UpdateMessage("#DOWNLOADING_MOD_TEXT", mod.Name, mod.Version);
+
+		if (HasRequiredModVersion(mod.Name, mod.Version))
+			continue;
+
+		const WorkshopSelection* workshopSelection = nullptr;
+
+		for (const WorkshopSelection& selection : workshopSelections)
+		{
+			if (selection.m_Name == mod.Name && selection.m_Version == mod.Version)
+			{
+				workshopSelection = &selection;
+				break;
+			}
+		}
+		if (workshopSelection)
+		{
+			spdlog::info("Installing ModWorkshop mod {} for server requirement {} v{}", workshopSelection->m_Alternative.modId, mod.Name,
+			             mod.Version);
+			g_pModDownloader->DownloadModWorkshop({.name = mod.Name, .version = mod.Version, .platform = ModSource::Thunderstore},
+			                                      workshopSelection->m_Alternative);
+		}
+		else
+		{
+			const auto advertisedDownload = std::find_if(
+				serverDownloads.begin(),
+				serverDownloads.end(),
+				[&mod](const ModDownloader::modentry_s& download)
+				{
+					return download.name == mod.Name && download.version == mod.Version;
+				});
+
+			spdlog::info("Auto-downloading mod {} version {}", mod.Name, mod.Version);
+			const bool started = advertisedDownload != serverDownloads.end()
+				? g_pModDownloader->DownloadServerMod(*advertisedDownload)
+				: g_pModDownloader->DownloadMod(mod.Name, mod.Version);
+			if (!started)
+			{
+				Interrupt(fmt::format("Failed to start download for {} v{}", mod.Name, mod.Version));
+				return;
+			}
+		}
+		m_bDownloadedMods = true;
+
+		while (!IsCancelled())
+		{
+			auto state = g_pModDownloader->modState.state;
+			if (state == ModDownloader::DOWNLOADING || state == ModDownloader::CHECKSUMING || state == ModDownloader::EXTRACTING)
+			{
+				Sleep(100);
+				continue;
+			}
+
+			if (g_pModDownloader->IsDownloadThreadRunning())
+			{
+				Sleep(50);
+				continue;
+			}
+
+			break;
+		}
+
+		RETURN_IF_CANCELLED()
+
+		bool downloadFailed = true;
+		bool downloadAborted = false;
+		std::string interruptMessage;
+
+		switch (g_pModDownloader->modState.state)
+		{
+		case ModDownloader::DONE:
+			downloadFailed = false;
+			break;
+		case ModDownloader::ABORTED:
+			downloadAborted = true;
+			downloadFailed = false;
+			break;
+		case ModDownloader::FAILED_READING_ARCHIVE:
+			interruptMessage = "#FAILED_READING_ARCHIVE";
+			break;
+		case ModDownloader::FAILED_WRITING_TO_DISK:
+			interruptMessage = "#FAILED_WRITING_TO_DISK";
+			break;
+		case ModDownloader::MOD_FETCHING_FAILED:
+			interruptMessage = "#MOD_FETCHING_FAILED";
+			break;
+		case ModDownloader::MOD_CORRUPTED: // Downloaded archive checksum does not match verified hash
+			interruptMessage = "#MOD_CORRUPTED";
+			break;
+		case ModDownloader::NO_DISK_SPACE_AVAILABLE:
+			interruptMessage = "#NO_DISK_SPACE_AVAILABLE";
+			break;
+		case ModDownloader::UNKNOWN_PLATFORM:
+			interruptMessage = "#MOD_FETCHING_FAILED_GENERAL";
+			break;
+		default:
+			break;
+		}
+
+		if (downloadAborted)
+			Interrupt();
+
+		if (downloadFailed)
+			Interrupt(fmt::format("Download for {} v{} failed: {}", mod.Name, mod.Version, interruptMessage));
+
+		RETURN_IF_CANCELLED()
+	}
+
+	RETURN_IF_CANCELLED()
+
+	UpdateMessage();
+}
+
+void ConnectionManager::ConnectToRemoteServer(const std::string& id, const std::string& password)
+{
+	g_pVanillaCompatibility->SetCompatabilityMode(VanillaCompatibility::CompatibilityMode::Northstar);
+
+	std::string serverId = id;
+	std::string serverPassword = password;
+
+	std::thread authThread(
+		[&, serverId, serverPassword]()
+		{
+			AuthenticateToMasterServer();
+
+			RETURN_IF_CANCELLED();
+
+			g_pMasterServerManager->RequestServerList();
+
+			UpdateMessage("#REQUESTING_SERVERS");
+
+			while (g_pMasterServerManager->m_bScriptRequestingServerList && !IsCancelled())
+				Sleep(100);
+
+			RETURN_IF_CANCELLED()
+
+			spdlog::info("Authenticating with remote server for uid {}", g_pLocalPlayerUserID);
+
+			m_flConnectionStartTime = g_PlatFloatTime();
+			float maxTime = g_pCVar->FindVar("cl_resend_timeout")->GetFloat();
+
+			RemoteServerInfo* serverInfo = nullptr;
+
+			for (auto& server : g_pMasterServerManager->m_vRemoteServers)
+			{
+				if (std::string(server.id) == serverId)
+				{
+					serverInfo = &server;
+					break;
+				}
+			}
+
+			if (!serverInfo)
+			{
+				spdlog::error("Failed to find server info for id {}", serverId);
+				Interrupt("Failed to authenticate with remote server: server not found");
+				return;
+			}
+
+			g_pMasterServerManager->AuthenticateWithServer(
+				g_pLocalPlayerUserID, g_pMasterServerManager->m_sOwnClientAuthToken, *serverInfo, serverPassword.c_str());
+
+			UpdateMessage("#DIALOG_SERVERCONNECTING_MSG", serverInfo->name);
+
+			while (!g_pMasterServerManager->m_bSuccessfullyAuthenticatedWithGameServer &&
+				   g_PlatFloatTime() - g_pConnectionManager->m_flConnectionStartTime < maxTime && !IsCancelled())
+				Sleep(100);
+
+			RETURN_IF_CANCELLED()
+
+			if (!g_pMasterServerManager->m_bSuccessfullyAuthenticatedWithGameServer)
+			{
+				spdlog::error("Timed out authenticating with remote server for uid {}", g_pLocalPlayerUserID);
+				Interrupt("Failed to authenticate with remote server: timeout");
+				return;
+			}
+
+			m_bAuthSucessful = true;
+
+			RemoteServerConnectionInfo& info = g_pMasterServerManager->m_pendingConnectionInfo;
+			g_pCVar->FindVar("serverfilter")->SetValue(info.authToken);
+
+			std::string ip = fmt::format(
+				"{}.{}.{}.{}", info.ip.S_un.S_un_b.s_b1, info.ip.S_un.S_un_b.s_b2, info.ip.S_un.S_un_b.s_b3, info.ip.S_un.S_un_b.s_b4);
+			int port = info.port;
+
+			std::string address = fmt::format("{}:{}", ip, port);
+
+			std::string netAdr = fmt::format("[::ffff:{}]:{}", ip, port);
+            PrepareServerModsAndConnect(CNetAdr(netAdr.c_str()), false, serverInfo->requiredMods, true, std::move(address), serverInfo->name);
+		});
+
+	authThread.detach();
+}
+
+void ConnectionManager::ConnectToP2PServer(const std::string& address)
+{
+	g_pVanillaCompatibility->SetCompatabilityMode(VanillaCompatibility::CompatibilityMode::Northstar);
+
+	std::thread authThread(
+		[&, address]()
+		{
+			AuthenticateToMasterServer();
+
+			RETURN_IF_CANCELLED()
+
+			spdlog::info("Authenticating with P2P server for uid {}", g_pLocalPlayerUserID);
+
+			std::string ip;
+			int port;
+			bool isV6;
+
+			if (!ParseAddress(address, ip, port, isV6) || !isV6 || port == -1 || ip.empty())
+			{
+				Interrupt("Failed to authenticate with P2P server: invalid p2p address");
+				return;
+			}
+
+			std::string formattedIP = fmt::format("[{}]:{}", ip, port);
+
+			spdlog::info("P2P server address parsed as {}", formattedIP);
+
+			CNetAdr addr = CNetAdr(formattedIP.c_str());
+
+            PrepareServerModsAndConnect(addr, true, {}, false, std::move(formattedIP));
+		});
+
+	authThread.detach();
+}
+
+void ConnectionManager::ConnectToDirectServer(const std::string& address)
+{
+	g_pVanillaCompatibility->SetCompatabilityMode(VanillaCompatibility::CompatibilityMode::Northstar);
+
+	std::thread authThread(
+		[&, address]()
+		{
+			AuthenticateToMasterServer();
+
+			RETURN_IF_CANCELLED()
+
+			spdlog::info("Authenticating with direct server at '{}' for uid {}", address, g_pLocalPlayerUserID);
+
+			std::string ip;
+			int port;
+			bool isV6;
+
+			if (!ParseAddress(address, ip, port, isV6))
+				ip = address;
+
+			if (port <= 0)
+				port = PORT_SERVER;
+
+			std::string connectAddress = fmt::format("{}:{}", ip, port);
+
+			CNetAdr addr;
+			if (!addr.SetFromString(connectAddress.c_str(), true))
+			{
+				Interrupt(fmt::format("Failed to resolve server address '{}'", connectAddress));
+				return;
+			}
+
+            PrepareServerModsAndConnect(addr, true, {}, false, std::move(connectAddress));
+		});
+
+	authThread.detach();
+}
+
+void ConnectionManager::ReloadModsAndConnect(std::vector<RemoteModInfo> requiredMods, std::string address, bool disableUnrequiredMods)
+{
+	UpdateMessage("#RELOADING_MODS");
+	const bool downloadedMods = m_bDownloadedMods;
+	if (m_bRetrying)
+		Sleep(500); // going too fast here can cause the UI to never start
+
+    RunInMainThread([this, requiredMods = std::move(requiredMods), address = std::move(address), downloadedMods, disableUnrequiredMods]() mutable
+    {
+		if (IsCancelled())
+			return;
+
+		bool shouldReloadMods = downloadedMods;
+		for (Mod& loaded : g_pModManager->m_LoadedMods)
+		{
+			const bool wasEnabled = loaded.m_bEnabled;
+			bool isRequired = false;
+
+			for (const RemoteModInfo& required : requiredMods)
+			{
+				if (loaded.Name != required.Name)
+					continue;
+
+				if (loaded.IsCoreMod() || loaded.Version == required.Version)
+				{
+					isRequired = true;
+					break;
+				}
+			}
+
+			if (isRequired)
+				loaded.m_bEnabled = true;
+            else if (disableUnrequiredMods && loaded.RequiredOnClient)
+                loaded.m_bEnabled = false;
+
+			if (wasEnabled != loaded.m_bEnabled)
+				shouldReloadMods = true;
+		}
+
+		if (shouldReloadMods)
+		{
+			g_pModManager->ReloadMods();
+
+			Cbuf_AddText(
+				Cbuf_GetCurrentPlayer(),
+				"reload_localization; loadPlaylists; weapon_reparse; playerSettings_reparse; uiscript_reset",
+				cmd_source_t::kCommandSrcCode);
+			Cbuf_Execute();
+		}
+
+		if (!IsCancelled())
+			FinaliseJoiningServer(address);
+    });
+}
+
+void ConnectionManager::FinaliseJoiningServer(std::string& address)
+{
+	if (m_bRetrying)
+	{
+		Retrying(false);
+		Cbuf_AddText(Cbuf_GetCurrentPlayer(), "retry", cmd_source_t::kCommandSrcCode);
+	}
+	else
+	{
+		std::string command;
+
+		Cbuf_AddText(Cbuf_GetCurrentPlayer(), fmt::format("connect {}", address).c_str(), cmd_source_t::kCommandSrcCode);
+	}
+}
+
+void ConnectionManager::FinaliseJoiningLocalServer()
+{
+	if (m_bRetrying)
+	{
+		Retrying(false);
+		Cbuf_AddText(Cbuf_GetCurrentPlayer(), "retry", cmd_source_t::kCommandSrcCode);
+	}
+	else
+	{
+		std::string mapName;
+		{
+			std::scoped_lock lock(m_MapLoadMutex);
+			if (m_szMapName.empty())
+				m_szMapName = "mp_lobby";
+			mapName = m_szMapName;
+			m_bMapLoadAuthorized = true;
+		}
+
+		Cbuf_AddText(Cbuf_GetCurrentPlayer(), fmt::format("map {}", mapName).c_str(), cmd_source_t::kCommandSrcCode);
+	}
+}
+
+void ConnectionManager::ConnectToLocalServer()
+{
+	g_pVanillaCompatibility->SetCompatabilityMode(VanillaCompatibility::CompatibilityMode::Northstar);
+	ConVar* allowInsecure = g_pCVar->FindVar("ns_auth_allow_insecure");
+	if (allowInsecure->GetBool())
+	{
+		m_bAuthSucessful = true;
+		FinaliseJoiningLocalServer();
+		Cbuf_Execute();
+		return;
+	}
+
+	std::thread authThread(
+		[&]()
+		{
+			AuthenticateToMasterServer();
+
+			RETURN_IF_CANCELLED();
+
+			spdlog::info("Authenticating with own server for uid {}", g_pLocalPlayerUserID);
+
+			m_flConnectionStartTime = g_PlatFloatTime();
+			float maxTime = g_pCVar->FindVar("cl_resend_timeout")->GetFloat();
+
+			g_pMasterServerManager->AuthenticateWithOwnServer(g_pLocalPlayerUserID, g_pMasterServerManager->m_sOwnClientAuthToken, {});
+
+			UpdateMessage("Getting account data.");
+
+			while (!g_pMasterServerManager->m_bSuccessfullyAuthenticatedWithGameServer &&
+				   g_PlatFloatTime() - g_pConnectionManager->m_flConnectionStartTime < maxTime && !IsCancelled())
+				Sleep(100);
+
+			RETURN_IF_CANCELLED()
+
+			if (!g_pMasterServerManager->m_bSuccessfullyAuthenticatedWithGameServer)
+			{
+				spdlog::error("Timed out authenticating with own server for uid {}", g_pLocalPlayerUserID);
+				Interrupt("Failed to authenticate with own server: timeout");
+				return;
+			}
+
+			if (g_pServerAuthentication->m_RemoteAuthenticationData.size())
+				g_pCVar->FindVar("serverfilter")->SetValue(g_pServerAuthentication->m_RemoteAuthenticationData.begin()->first.c_str());
+
+			m_bAuthSucessful = true;
+
+			RETURN_IF_CANCELLED()
+
+			FinaliseJoiningLocalServer();
+		});
+
+	authThread.detach();
+}
+
+// clang-format off
+DECLARE_HOOK(matchmake, engine.dll + 0xF220, [](auto& hook) -> int*
+{
+	g_pVanillaCompatibility->SetCompatabilityMode(VanillaCompatibility::CompatibilityMode::Vanilla);
+	g_pConnectionManager->SetMatchmaking();
+
+	if (Cvar_cl_unload_remote_mods_on_matchmaking->GetBool() && !g_pConnectionManager->UnloadingRemoteModsOnMatchmaking())
+	{
+		g_pConnectionManager->SetUnloadingRemoteModsOnMatchmaking(true);
+		g_TaskQueue.Dispatch([]()
+		{
+			int affectedMods = 0;
+			for (Mod& loaded : g_pModManager->m_LoadedMods)
+			{
+				if (loaded.RequiredOnClient && loaded.IsRemote() && loaded.m_bEnabled && !loaded.IsCoreMod())
+				{
+					++affectedMods;
+					loaded.m_bEnabled = false;
+				}
+			}
+
+			if (affectedMods > 0)
+			{
+				g_pModManager->ReloadMods();
+				Cbuf_AddText(
+					Cbuf_GetCurrentPlayer(),
+					"reload_localization; loadPlaylists; weapon_reparse; playerSettings_reparse; uiscript_reset",
+					cmd_source_t::kCommandSrcCode);
+			}
+
+			Cbuf_AddText(Cbuf_GetCurrentPlayer(), "matchmake", cmd_source_t::kCommandSrcCode);
+			Cbuf_Execute();
+		});
+		return 0;
+	}
+
+	return hook.Original();
+})
+// clang-format on
+
+// clang-format off
+DECLARE_HOOK(silentconnect, engine.dll + 0x76F00, [](auto& hook, __int64 a1) -> int*
+{
+	g_pVanillaCompatibility->SetCompatabilityMode(VanillaCompatibility::CompatibilityMode::Vanilla);
+	g_pConnectionManager->SetMatchmaking();
+
+	return hook.Original(a1);
+})
+// clang-format on
+
+// clang-format off
+DECLARE_HOOK(Host_Disconnect, engine.dll + 0x15ABE0, [](auto& hook, bool bShowMainMenu)
+{
+	if(!IsDedicatedServer())
+	{
+		g_pConnectionManager->Retrying(false);
+		g_pConnectionManager->Finalise();
+		g_pConnectionManager->ResetState();
+	}
+
+	hook.Original(bShowMainMenu);
+})
+// clang-format on
+
+// clang-format off
+DECLARE_HOOK(concommand_disconnect, engine.dll + 0x15C080, [](auto& hook, __int64 args) -> int*
+{
+	if(!IsDedicatedServer())
+	{
+		g_pConnectionManager->Retrying(false);
+		g_pConnectionManager->Finalise();
+		g_pConnectionManager->ResetState();
+	}
+	return hook.Original(args);
+})
+// clang-format on
+
+// clang-format off
+DECLARE_HOOK(CL_FullyConnected, engine.dll + 0x72D20, [](auto& hook) -> int
+{
+	g_pConnectionManager->Finalise();
+	g_pConnectionManager->ResetState();
+
+	return hook.Original();
+})
+// clang-format on
+
+// clang-format off
+DECLARE_HOOK(retry, engine.dll + 0x73D10, [](auto& hook, __int64 a1) -> int*
+{
+	g_bRetryingConnection = true;
+	g_pConnectionManager->Retrying(true);
+	return hook.Original(a1);
+})
+// clang-format on
+
+// clang-format off
+DECLARE_HOOK(concommand_connect, engine.dll + 0x76720, [](auto& hook, const CCommand* args) -> __int64
+{
+	if (!g_pConnectionManager->IsConnecting())
+	{
+		std::string cmd = args->GetCommandString();
+
+		auto firstSpace = cmd.find(' ');
+		if (firstSpace == std::string::npos)
+			return hook.Original(args);
+
+		std::string rest = cmd.substr(firstSpace + 1);
+
+		auto nonSpace = rest.find_first_not_of(" \t");
+		if (nonSpace == std::string::npos)
+			return hook.Original(args);
+		rest = rest.substr(nonSpace);
+
+		std::string address;
+		bool useSCRPlaque = true;
+
+		auto sep = rest.find_first_of(" \t");
+		if (sep == std::string::npos)
+		{
+			address = rest;
+		}
+		else
+		{
+			address = rest.substr(0, sep);
+
+			auto flagStart = rest.find_first_not_of(" \t", sep);
+			if (flagStart != std::string::npos)
+			{
+				std::string flag = rest.substr(flagStart);
+				if (!flag.empty() && flag[0] == '0')
+					useSCRPlaque = false;
+			}
+		}
+
+		auto mode = g_pConnectionManager->DetermineModeFromAddress(address);
+
+
+		const char* mp_gamemode = g_pCVar->FindVar("mp_gamemode") ? g_pCVar->FindVar("mp_gamemode")->GetString() : "";
+		bool isSolo = (mp_gamemode && strcmp(mp_gamemode, "solo") == 0);
+
+		if (isSolo && mode == ConnectionManager::eConnectionMode::LocalServer)
+			return hook.Original(args);
+
+		if (mode != ConnectionManager::eConnectionMode::LocalServer || mode != ConnectionManager::eConnectionMode::P2P || !isSolo)
+		{
+			if (g_pConnectionManager->GetCurrentMode() == ConnectionManager::eConnectionMode::Matchmaking)
+				return hook.Original(args);
+		}
+
+		if (g_pConnectionManager->IsRetrying())
+			mode = g_pConnectionManager->GetCurrentMode();
+		else
+			spdlog::info("Determined connection mode from address '{}': {}", address,
+						 static_cast<int>(mode)); // log as int, not char
+
+		g_pConnectionManager->Connect(address, mode, useSCRPlaque);
+		return 0;
+	}
+
+	return hook.Original(args);
+})
+// clang-format on
+
+// clang-format off
+DECLARE_HOOK(connectWithKey, engine.dll + 0x768C0, [](auto& hook, const CCommand* args) -> int*
+{
+	if (!g_pConnectionManager->IsConnecting())
+	{
+		if (g_pConnectionManager->GetCurrentMode() == ConnectionManager::eConnectionMode::Matchmaking)
+			return hook.Original(args);
+
+		if (args->ArgC() < 3)
+			return hook.Original(args);
+
+		const char* address = args->Arg(1);
+		if (CommandLine()->CheckParm("-particletools") && std::string_view(address).starts_with("127.0.0.1"))
+		{
+			g_pVanillaCompatibility->SetCompatabilityMode(VanillaCompatibility::CompatibilityMode::Northstar);
+			spdlog::info("[ParticleTools] Connecting directly to keyed local preview server at '{}'", address);
+			return hook.Original(args);
+		}
+
+
+		auto mode = g_pConnectionManager->DetermineModeFromAddress(address);
+		if (g_pConnectionManager->IsRetrying())
+			mode = g_pConnectionManager->GetCurrentMode();
+		else
+			spdlog::info("Determined connection mode from address '{}': {}", address, static_cast<int>(mode));
+
+		int argCount = args->ArgC();
+		bool useSCRPlaque = true;
+
+		if (argCount == 4)
+			atoi(args->Arg(3)) == 0 ? useSCRPlaque = false : useSCRPlaque = true;
+
+		g_pConnectionManager->Connect(address, mode, useSCRPlaque);
+
+		return 0;
+	}
+
+	return hook.Original(args);
+})
+// clang-format on
+
+void ConCommand_connectWithRemoteId(const CCommand& args)
+{
+	if (args.ArgC() < 3)
+	{
+		spdlog::warn("connectWithRemoteId called with insufficient arguments");
+		return;
+	}
+
+	std::string remoteId = args.Arg(1);
+	std::string password = args.Arg(2);
+
+	bool useSCRPlaque = true;
+
+	if (args.ArgC() == 4)
+		atoi(args.Arg(3)) == 0 ? useSCRPlaque = false : useSCRPlaque = true;
+
+	if (password == "0")
+		password = "";
+
+	g_pConnectionManager->Connect(remoteId, password, useSCRPlaque);
+}
+
+ADD_SQFUNC("void", NSDecideModDownload, "bool accept", "", ScriptContext::UI)
+{
+	bool accepted = g_pSquirrel[context]->getbool(sqvm, 1);
+
+	if (accepted)
+		g_pConnectionManager->SetModAcceptState(ConnectionManager::eModAcceptState::ACCEPTED);
+	else
+		g_pConnectionManager->SetModAcceptState(ConnectionManager::eModAcceptState::DENIED);
+
+	return SQRESULT_NULL;
+}
+
+ON_DLL_LOAD_CLIENT_RELIESON("engine.dll", ConnectHooks, ConVar, [](CModule module)
+{
+	DISPATCH_MODULE(ConnectHooks)
+
+	g_pConnectionManager = new ConnectionManager();
+
+	Cvar_cl_resend_inforequest_timeout = new ConVar(
+		"cl_resend_inforequest_timeout",
+		"10.0",
+		FCVAR_CLIENTDLL | FCVAR_ARCHIVE_PLAYERPROFILE,
+		"Max time in seconds to wait for a server info response when connecting to non-remote servers.");
+	Cvar_cl_resend_inforequest_timeout_remote = new ConVar(
+		"cl_resend_inforequest_timeout_remote",
+		"2.5",
+		FCVAR_CLIENTDLL | FCVAR_ARCHIVE_PLAYERPROFILE,
+		"Max time in seconds to wait for a server info response when connecting to remote servers.");
+	Cvar_cl_resend_inforequest_interval_ms = new ConVar(
+		"cl_resend_inforequest_interval_ms",
+		"500",
+		FCVAR_CLIENTDLL | FCVAR_ARCHIVE_PLAYERPROFILE,
+		"Interval in milliseconds between server info requests when connecting to a server.");
+	Cvar_cl_unload_remote_mods_on_matchmaking = new ConVar(
+		"cl_unload_remote_mods_on_matchmaking",
+		"1",
+		FCVAR_CLIENTDLL | FCVAR_ARCHIVE_PLAYERPROFILE,
+		"Whether to unload remote requiredOnClient mods when joining matchmaking (vanilla) games.");
+	RegisterConCommand(
+		"connectWithRemoteId",
+		ConCommand_connectWithRemoteId,
+		"Connects to a server using its remote ID from the master server",
+		FCVAR_CLIENTDLL);
+
+	SCR_BeginLoadingPlaque = module.Offset(0xB92E0).RCast<decltype(SCR_BeginLoadingPlaque)>();
+	SCR_EndLoadingPlaque = module.Offset(0xB9470).RCast<decltype(SCR_EndLoadingPlaque)>();
+})
+void ConCommand_ns_start_reauth_and_leave_to_lobby(const CCommand& arg)
+{
+	NOTE_UNUSED(arg);
+	// hack for special case where we're on a local server, so we erase our own newly created auth data on disconnect
+	g_bConnectingToServer = true;
+	g_bRetryingConnection = false;
+	g_pMasterServerManager->m_bNewgameAfterSelfAuth = true;
+	g_pMasterServerManager->AuthenticateWithOwnServer(g_pLocalPlayerUserID, g_pMasterServerManager->m_sOwnClientAuthToken, {});
+}
+
+void ConCommand_ns_end_reauth_and_leave_to_lobby(const CCommand& arg)
+{
+	NOTE_UNUSED(arg);
+	if (g_pServerAuthentication->m_RemoteAuthenticationData.size())
+		g_pCVar->FindVar("serverfilter")->SetValue(g_pServerAuthentication->m_RemoteAuthenticationData.begin()->first.c_str());
+
+	// weird way of checking, but check if client script vm is initialised, mainly just to allow players to cancel this
+	if (g_pSquirrel[ScriptContext::CLIENT]->m_pSQVM)
+	{
+		g_pServerAuthentication->m_bNeedLocalAuthForNewgame = true;
+
+		// this won't set playlist correctly on remote clients, don't think they can set playlist until they've left which sorta
+		// fucks things should maybe set this in HostState_NewGame?
+		R2::SetCurrentPlaylist("tdm");
+		std::string cmd = fmt::format("map {}", "mp_lobby");
+		Cbuf_AddText(
+			Cbuf_GetCurrentPlayer(),
+			cmd.c_str(),
+			cmd_source_t::kCommandSrcCode);
+	}
+}
+
+ON_DLL_LOAD_RELIESON("engine.dll", ClientReauthenticationCommands, ConCommand, [](CModule)
+{
+	RegisterConCommand(
+		"ns_start_reauth_and_leave_to_lobby",
+		ConCommand_ns_start_reauth_and_leave_to_lobby,
+		"called by the server, used to reauth and return the player to lobby when leaving a game",
+		FCVAR_SERVER_CAN_EXECUTE);
+
+	// this is a concommand because we make a deferred call to it from another thread
+	RegisterConCommand("ns_end_reauth_and_leave_to_lobby", ConCommand_ns_end_reauth_and_leave_to_lobby, "", FCVAR_NONE);
+})

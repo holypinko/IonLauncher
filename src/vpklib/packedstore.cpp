@@ -26,7 +26,8 @@
 /////////////////////////////////////////////////////////////////////////////////
 
 #include "vpklib/packedstore.h"
-#include "core/filesystem/filesystem.h"
+#include "filesystem/basefilesystem.h"
+#include "modsystem/modfilesystem.h"
 #include "localize/ilocalize.h"
 #include "mathlib/crc32.h"
 #include "mathlib/sha1.h"
@@ -34,6 +35,41 @@
 
 #include <fstream>
 #include <regex>
+
+DECLARE_MODULE(PackedStoreFilesystemHooks)
+
+DECLARE_HOOK(ReadFileFromVPK, filesystem_stdio.dll + 0x5CBA0,
+             [](auto& hook, CPackedStore* vpkInfo, PackedFileOpenData* b, char* filename) -> PackedFileOpenData*
+{
+    // don't compile here because this is only ever called from OpenEx, which already compiles
+    if (TryReplaceFile(filename, false))
+    {
+        b->m_nArchiveIndex = -1;
+        b->m_bTextMode = false;
+        return b;
+    }
+
+    CPackedStore* const preferredVPK = GetPreferredModVPK(filename);
+
+    // Remounted archives are appended after vanilla. Preserve the registered
+    // source for models and every explicitly map-owned archive member.
+    if (preferredVPK && vpkInfo != preferredVPK)
+    {
+        if (b)
+        {
+            b->m_nArchiveIndex = -1;
+            b->m_bTextMode = false;
+        }
+        return b;
+    }
+
+    return hook.Original(vpkInfo, b, filename);
+})
+
+void InitialisePackedStoreFilesystemHooks()
+{
+    DISPATCH_MODULE(PackedStoreFilesystemHooks)
+}
 
 static const std::regex g_VpkDirFileRegex{R"(([^_\/]+)_([^.]*)\.bsp\.pak000_dir.vpk)"};
 static const std::regex g_VpkPackFileRegex{R"(pak000_(\d{3})(?=\.vpk))"};

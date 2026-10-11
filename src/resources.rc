@@ -2,7 +2,7 @@
 //
 #include "resource1.h"
 #include "crash_sounds.h"
-#include "../include/ns_version.h"
+#include "ns_version.h"
 
 #define APSTUDIO_READONLY_SYMBOLS
 /////////////////////////////////////////////////////////////////////////////

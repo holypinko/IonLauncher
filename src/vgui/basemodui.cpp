@@ -1,6 +1,6 @@
 #include "vgui/basemodui.h"
-#include "core/tier0.h"
-#include "server/auth/serverauthentication.h"
+#include "tier0/platform.h"
+#include "engine/server/serverauthentication.h"
 #include "tier1/cvar.h"
 
 DECLARE_MODULE(BaseModUIHooks)

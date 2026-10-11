@@ -1,5 +1,17 @@
 #include "tier0/memstd.h"
-#include "core/tier0.h"
+#include "tier0/memalloc.h"
+
+IMemAlloc* g_pMemAllocSingleton = nullptr;
+
+using CreateGlobalMemAlloc_t = IMemAlloc* (*)();
+CreateGlobalMemAlloc_t CreateGlobalMemAlloc;
+
+void TryCreateGlobalMemAlloc()
+{
+	CreateGlobalMemAlloc =
+		reinterpret_cast<CreateGlobalMemAlloc_t>(GetProcAddress(GetModuleHandleA("tier0.dll"), "CreateGlobalMemAlloc"));
+	g_pMemAllocSingleton = CreateGlobalMemAlloc(); // Returns the existing allocator when already created.
+}
 
 // TODO: rename to malloc and free after removing statically compiled .libs
 

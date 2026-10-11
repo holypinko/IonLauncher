@@ -1,0 +1,534 @@
+#include "game/client/localchatwriter.h"
+#include "tier1/cvar.h"
+#include "common/chat.h"
+#include "util/utils.h"
+#include "vscript/languages/squirrel_re/squirrel.h"
+
+ConVar* Cvar_ns_write_raw_chat_to_console;
+
+class vgui_BaseRichText_vtable;
+
+class vgui_BaseRichText
+{
+public:
+	vgui_BaseRichText_vtable* vtable;
+};
+
+class vgui_BaseRichText_vtable
+{
+public:
+	char unknown1[1880];
+
+	void (*InsertChar)(vgui_BaseRichText* self, wchar_t ch);
+
+	void (*InsertStringWide)(vgui_BaseRichText* self, const wchar_t* text);
+	void (*InsertStringAnsi)(vgui_BaseRichText* self, const char* text);
+
+	void (*SelectNone)(vgui_BaseRichText* self);
+	void (*SelectAllText)(vgui_BaseRichText* self);
+	void (*SelectNoText)(vgui_BaseRichText* self);
+	void (*CutSelected)(vgui_BaseRichText* self);
+	void (*CopySelected)(vgui_BaseRichText* self);
+	void (*SetPanelInteractive)(vgui_BaseRichText* self, bool interactive);
+	void (*SetUnusedScrollbarInvisible)(vgui_BaseRichText* self, bool invisible);
+
+	void* unknown2;
+
+	void (*GotoTextStart)(vgui_BaseRichText* self);
+	void (*GotoTextEnd)(vgui_BaseRichText* self);
+
+	void* unknown3[3];
+
+	void (*SetVerticalScrollbar)(vgui_BaseRichText* self, bool state);
+	void (*SetMaximumCharCount)(vgui_BaseRichText* self, int maximumCharacters);
+	void (*InsertColorChange)(vgui_BaseRichText* self, Color color);
+	void (*InsertIndentChange)(vgui_BaseRichText* self, int pixelsIndent);
+	void (*InsertClickableTextStart)(vgui_BaseRichText* self, const char* clickAction);
+	void (*InsertClickableTextEnd)(vgui_BaseRichText* self);
+	void (*InsertPossibleURLString)(vgui_BaseRichText* self, const char* text, Color urlTextColor, Color normalTextColor);
+	void (*InsertFade)(vgui_BaseRichText* self, float sustain, float length);
+	void (*ResetAllFades)(vgui_BaseRichText* self, bool hold, bool onlyExpired, float newSustain);
+	void (*SetToFullHeight)(vgui_BaseRichText* self);
+	int (*GetNumLines)(vgui_BaseRichText* self);
+};
+
+static_assert(offsetof(vgui_BaseRichText_vtable, InsertChar) == 0x758);
+static_assert(offsetof(vgui_BaseRichText_vtable, InsertStringWide) == 0x760);
+static_assert(offsetof(vgui_BaseRichText_vtable, InsertStringAnsi) == 0x768);
+static_assert(offsetof(vgui_BaseRichText_vtable, InsertColorChange) == 0x7E8);
+static_assert(offsetof(vgui_BaseRichText_vtable, InsertFade) == 0x810);
+
+static vgui_BaseRichText* GetRawRichText(vgui::RichText* richText)
+{
+	return reinterpret_cast<vgui_BaseRichText*>(richText);
+}
+
+
+
+ConVar** gGameSettings;
+ConVar** gChatFadeLength;
+ConVar** gChatFadeSustain;
+
+CHudChat** CHudChat::allHuds;
+
+typedef void(__fastcall* ConvertANSIToUnicodeType)(LPCSTR ansi, int ansiCharLength, LPWSTR unicode, int unicodeCharLength);
+ConvertANSIToUnicodeType ConvertANSIToUnicode;
+
+LocalChatWriter::SwatchColor swatchColors[4] = {
+	LocalChatWriter::MainTextColor,
+	LocalChatWriter::SameTeamNameColor,
+	LocalChatWriter::EnemyTeamNameColor,
+	LocalChatWriter::NetworkNameColor,
+};
+
+Color darkColors[8] = {
+	Color {0, 0, 0, 255},
+	Color {205, 49, 49, 255},
+	Color {13, 188, 121, 255},
+	Color {229, 229, 16, 255},
+	Color {36, 114, 200, 255},
+	Color {188, 63, 188, 255},
+	Color {17, 168, 205, 255},
+	Color {229, 229, 229, 255}};
+
+Color lightColors[8] = {
+	Color {102, 102, 102, 255},
+	Color {241, 76, 76, 255},
+	Color {35, 209, 139, 255},
+	Color {245, 245, 67, 255},
+	Color {59, 142, 234, 255},
+	Color {214, 112, 214, 255},
+	Color {41, 184, 219, 255},
+	Color {255, 255, 255, 255}};
+
+class AnsiEscapeParser
+{
+public:
+	explicit AnsiEscapeParser(LocalChatWriter* writer)
+		: m_writer(writer)
+	{
+	}
+
+	void HandleVal(unsigned long val)
+	{
+		switch (m_next)
+		{
+		case Next::ControlType:
+			m_next = HandleControlType(val);
+			break;
+		case Next::ForegroundType:
+			m_next = HandleForegroundType(val);
+			break;
+		case Next::Foreground8Bit:
+			m_next = HandleForeground8Bit(val);
+			break;
+		case Next::ForegroundR:
+			m_next = HandleForegroundR(val);
+			break;
+		case Next::ForegroundG:
+			m_next = HandleForegroundG(val);
+			break;
+		case Next::ForegroundB:
+			m_next = HandleForegroundB(val);
+			break;
+		}
+	}
+
+private:
+	enum class Next
+	{
+		ControlType,
+		ForegroundType,
+		Foreground8Bit,
+		ForegroundR,
+		ForegroundG,
+		ForegroundB
+	};
+
+	LocalChatWriter* m_writer;
+	Next m_next = Next::ControlType;
+	Color m_expandedColor {0, 0, 0, 0};
+
+	Next HandleControlType(unsigned long val)
+	{
+		// Reset
+		if (val == 0 || val == 39)
+		{
+			m_writer->InsertSwatchColorChange(LocalChatWriter::MainTextColor);
+			return Next::ControlType;
+		}
+
+		// Dark foreground color
+		if (val >= 30 && val < 38)
+		{
+			m_writer->InsertColorChange(darkColors[val - 30]);
+			return Next::ControlType;
+		}
+
+		// Light foreground color
+		if (val >= 90 && val < 98)
+		{
+			m_writer->InsertColorChange(lightColors[val - 90]);
+			return Next::ControlType;
+		}
+
+		// Game swatch color
+		if (val >= 110 && val < 114)
+		{
+			m_writer->InsertSwatchColorChange(swatchColors[val - 110]);
+			return Next::ControlType;
+		}
+
+		// Expanded foreground color
+		if (val == 38)
+		{
+			return Next::ForegroundType;
+		}
+
+		return Next::ControlType;
+	}
+
+	Next HandleForegroundType(unsigned long val)
+	{
+		// Next values are r,g,b
+		if (val == 2)
+		{
+			m_expandedColor.SetColor(0, 0, 0, 255);
+			return Next::ForegroundR;
+		}
+		// Next value is 8-bit swatch color
+		if (val == 5)
+		{
+			return Next::Foreground8Bit;
+		}
+
+		// Invalid
+		return Next::ControlType;
+	}
+
+	Next HandleForeground8Bit(unsigned long val)
+	{
+		if (val < 8)
+		{
+			m_writer->InsertColorChange(darkColors[val]);
+		}
+		else if (val < 16)
+		{
+			m_writer->InsertColorChange(lightColors[val - 8]);
+		}
+		else if (val < 232)
+		{
+			unsigned char code = val - 16;
+			unsigned char blue = code % 6;
+			unsigned char green = ((code - blue) / 6) % 6;
+			unsigned char red = (code - blue - (green * 6)) / 36;
+			m_writer->InsertColorChange(Color {(unsigned char)(red * 51), (unsigned char)(green * 51), (unsigned char)(blue * 51), 255});
+		}
+		else if (val < UCHAR_MAX)
+		{
+			unsigned char brightness = (val - 232) * 10 + 8;
+			m_writer->InsertColorChange(Color {brightness, brightness, brightness, 255});
+		}
+
+		return Next::ControlType;
+	}
+
+	Next HandleForegroundR(unsigned long val)
+	{
+		if (val >= UCHAR_MAX)
+			return Next::ControlType;
+
+		m_expandedColor[0] = (unsigned char)val;
+		return Next::ForegroundG;
+	}
+
+	Next HandleForegroundG(unsigned long val)
+	{
+		if (val >= UCHAR_MAX)
+			return Next::ControlType;
+
+		m_expandedColor[1] = (unsigned char)val;
+		return Next::ForegroundB;
+	}
+
+	Next HandleForegroundB(unsigned long val)
+	{
+		if (val >= UCHAR_MAX)
+			return Next::ControlType;
+
+		m_expandedColor[2] = (unsigned char)val;
+		m_writer->InsertColorChange(m_expandedColor);
+		return Next::ControlType;
+	}
+};
+
+LocalChatWriter::LocalChatWriter(Context context)
+	: m_context(context)
+{
+}
+
+void LocalChatWriter::Write(const char* str)
+{
+	char writeBuffer[256];
+
+	while (true)
+	{
+		const char* startOfEscape = strstr(str, "\033[");
+
+		if (startOfEscape == NULL)
+		{
+			// No more escape sequences, write the remaining text and exit
+			InsertText(str);
+			break;
+		}
+
+		if (startOfEscape != str)
+		{
+			// There is some text before the escape sequence, just print that
+			size_t copyChars = startOfEscape - str;
+			if (copyChars > 255)
+				copyChars = 255;
+
+			strncpy_s(writeBuffer, copyChars + 1, str, copyChars);
+
+			InsertText(writeBuffer);
+		}
+
+		const char* escape = startOfEscape + 2;
+		str = ApplyAnsiEscape(escape);
+	}
+}
+
+void LocalChatWriter::WriteLine(const char* str)
+{
+	InsertChar(L'\n');
+	InsertSwatchColorChange(MainTextColor);
+	Write(str);
+}
+
+void LocalChatWriter::InsertChar(wchar_t ch)
+{
+	for (CHudChat* hud = *CHudChat::allHuds; hud != NULL; hud = hud->next)
+	{
+		if (hud->m_unknownContext != (int)m_context)
+			continue;
+
+		vgui_BaseRichText* richText = GetRawRichText(hud->m_richText);
+		richText->vtable->InsertChar(richText, ch);
+	}
+
+	if (ch != L'\n')
+	{
+		InsertDefaultFade();
+	}
+}
+
+void LocalChatWriter::InsertText(const char* str)
+{
+	if( Cvar_ns_write_raw_chat_to_console->GetBool() )
+		spdlog::info(str);
+
+	WCHAR messageUnicode[288];
+	ConvertANSIToUnicode(str, -1, messageUnicode, 274);
+
+	for (CHudChat* hud = *CHudChat::allHuds; hud != NULL; hud = hud->next)
+	{
+		if (hud->m_unknownContext != (int)m_context)
+			continue;
+
+		vgui_BaseRichText* richText = GetRawRichText(hud->m_richText);
+		richText->vtable->InsertStringWide(richText, messageUnicode);
+	}
+
+	InsertDefaultFade();
+}
+
+void LocalChatWriter::InsertText(const wchar_t* str)
+{
+	for (CHudChat* hud = *CHudChat::allHuds; hud != NULL; hud = hud->next)
+	{
+		if (hud->m_unknownContext != (int)m_context)
+			continue;
+
+		vgui_BaseRichText* richText = GetRawRichText(hud->m_richText);
+		richText->vtable->InsertStringWide(richText, str);
+	}
+
+	InsertDefaultFade();
+}
+
+void LocalChatWriter::InsertColorChange(Color color)
+{
+	for (CHudChat* hud = *CHudChat::allHuds; hud != NULL; hud = hud->next)
+	{
+		if (hud->m_unknownContext != (int)m_context)
+			continue;
+
+		vgui_BaseRichText* richText = GetRawRichText(hud->m_richText);
+		richText->vtable->InsertColorChange(richText, color);
+	}
+}
+
+static Color GetHudSwatchColor(CHudChat* hud, LocalChatWriter::SwatchColor swatchColor)
+{
+	switch (swatchColor)
+	{
+	case LocalChatWriter::MainTextColor:
+		return hud->m_mainTextColor;
+
+	case LocalChatWriter::SameTeamNameColor:
+		return hud->m_sameTeamColor;
+
+	case LocalChatWriter::EnemyTeamNameColor:
+		return hud->m_enemyTeamColor;
+
+	case LocalChatWriter::NetworkNameColor:
+		return hud->m_networkNameColor;
+	}
+
+	return Color(0, 0, 0, 0);
+}
+
+void LocalChatWriter::InsertSwatchColorChange(SwatchColor swatchColor)
+{
+	for (CHudChat* hud = *CHudChat::allHuds; hud != NULL; hud = hud->next)
+	{
+		if (hud->m_unknownContext != (int)m_context)
+			continue;
+		vgui_BaseRichText* richText = GetRawRichText(hud->m_richText);
+		richText->vtable->InsertColorChange(richText, GetHudSwatchColor(hud, swatchColor));
+	}
+}
+
+const char* LocalChatWriter::ApplyAnsiEscape(const char* escape)
+{
+	AnsiEscapeParser decoder(this);
+	while (true)
+	{
+		char* afterControlType = NULL;
+		unsigned long controlType = strtoul(escape, &afterControlType, 10);
+
+		// Malformed cases:
+		// afterControlType = NULL: strtoul errored
+		// controlType = 0 and escape doesn't actually start with 0: wasn't a number
+		if (afterControlType == NULL || (controlType == 0 && escape[0] != '0'))
+		{
+			return escape;
+		}
+
+		decoder.HandleVal(controlType);
+
+		// m indicates the end of the sequence
+		if (afterControlType[0] == 'm')
+		{
+			return afterControlType + 1;
+		}
+
+		// : or ; indicates more values remain, anything else is malformed
+		if (afterControlType[0] != ':' && afterControlType[0] != ';')
+		{
+			return afterControlType;
+		}
+
+		escape = afterControlType + 1;
+	}
+}
+
+void LocalChatWriter::InsertDefaultFade()
+{
+	float fadeLength = 0.f;
+	float fadeSustain = 0.f;
+	if ((*gGameSettings)->m_Value.m_nValue)
+	{
+		fadeLength = (*gChatFadeLength)->m_Value.m_fValue;
+		fadeSustain = (*gChatFadeSustain)->m_Value.m_fValue;
+	}
+
+	for (CHudChat* hud = *CHudChat::allHuds; hud != NULL; hud = hud->next)
+	{
+		if (hud->m_unknownContext != (int)m_context)
+			continue;
+		vgui_BaseRichText* richText = GetRawRichText(hud->m_richText);
+		richText->vtable->InsertFade(richText, fadeSustain, fadeLength);
+	}
+}
+
+ON_DLL_LOAD_CLIENT("client.dll", LocalChatWriter, [](CModule module)
+{
+	gGameSettings = module.Offset(0x11BAA48).RCast<ConVar**>();
+	gChatFadeLength = module.Offset(0x11BAB78).RCast<ConVar**>();
+	gChatFadeSustain = module.Offset(0x11BAC08).RCast<ConVar**>();
+	CHudChat::allHuds = module.Offset(0x11BA9E8).RCast<CHudChat**>();
+	//Patch chat history to be much larger
+	module.Offset(0x022DE35).Patch({0xBA, 0xFF, 0xFF, 0xFF ,0xFF});
+	ConvertANSIToUnicode = module.Offset(0x7339A0).RCast<ConvertANSIToUnicodeType>();
+
+	Cvar_ns_write_raw_chat_to_console = new ConVar("ns_write_raw_chat_to_console", "0", FCVAR_NONE, "Write raw chat message output to the console. 1 = enabled, 0 = disabled.");
+})
+
+bool CHudChat::ProcessMessage(const char* message, int inboxId, bool isTeam, bool isDead)
+{
+	int senderId = inboxId & CUSTOM_MESSAGE_INDEX_MASK;
+	bool isAnonymous = senderId == 0;
+	bool isCustom = isAnonymous || (inboxId & CUSTOM_MESSAGE_INDEX_BIT);
+
+	// Type is set to 0 for non-custom messages, custom messages have a type encoded as the first byte
+	int type = 0;
+	const char* payload = message;
+	if (isCustom)
+	{
+		type = message[0];
+		payload = message + 1;
+	}
+
+	RemoveAsciiControlSequences(const_cast<char*>(message), true);
+
+	SQRESULT result = g_pSquirrel[ScriptContext::CLIENT]->Call(
+		"CHudChat_ProcessMessageStartThread", static_cast<int>(senderId) - 1, payload, isTeam, isDead, type);
+	return result != SQRESULT_ERROR;
+}
+
+DECLARE_MODULE(ClientChatHooks)
+
+DECLARE_HOOK(CHudChat::AddGameLine, client.dll + 0x22E580, [](auto& hook, CHudChat* self, const char* message, int inboxId, bool isTeam, bool isDead)
+{
+	// This hook is called for each HUD, but we only want our logic to run once.
+	if (self != *CHudChat::allHuds)
+		return;
+
+	if (!self->ProcessMessage(message, inboxId, isTeam, isDead))
+		for (CHudChat* hud = *CHudChat::allHuds; hud != NULL; hud = hud->next)
+			hook.Original(hud, message, inboxId, isTeam, isDead);
+})
+
+ADD_SQFUNC("void", NSChatWrite, "int context, string text", "", ScriptContext::CLIENT)
+{
+	int chatContext = g_pSquirrel[ScriptContext::CLIENT]->getinteger(sqvm, 1);
+	const char* str = g_pSquirrel[ScriptContext::CLIENT]->getstring(sqvm, 2);
+
+	LocalChatWriter((LocalChatWriter::Context)chatContext).Write(str);
+	return SQRESULT_NULL;
+}
+
+ADD_SQFUNC("void", NSChatWriteRaw, "int context, string text", "", ScriptContext::CLIENT)
+{
+	int chatContext = g_pSquirrel[ScriptContext::CLIENT]->getinteger(sqvm, 1);
+	const char* str = g_pSquirrel[ScriptContext::CLIENT]->getstring(sqvm, 2);
+
+	LocalChatWriter((LocalChatWriter::Context)chatContext).InsertText(str);
+	return SQRESULT_NULL;
+}
+
+ADD_SQFUNC("void", NSChatWriteLine, "int context, string text", "", ScriptContext::CLIENT)
+{
+	int chatContext = g_pSquirrel[ScriptContext::CLIENT]->getinteger(sqvm, 1);
+	const char* str = g_pSquirrel[ScriptContext::CLIENT]->getstring(sqvm, 2);
+
+	LocalChatWriter((LocalChatWriter::Context)chatContext).WriteLine(str);
+	return SQRESULT_NULL;
+}
+
+ON_DLL_LOAD_CLIENT("client.dll", ClientChatHooks, [](CModule module)
+{
+	DISPATCH_MODULE(ClientChatHooks)
+})

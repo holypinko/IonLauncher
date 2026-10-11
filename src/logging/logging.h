@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "vscript/languages/squirrel_re/squirrel.h"
-#include "mathlib/color.h"
+#include "logging/logcolors.h"
 
 void LogSys_CreateLogFiles();
 void LogSys_InitialiseLogging();

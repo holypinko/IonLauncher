@@ -1,0 +1,16 @@
+#pragma once
+
+#include "common/chat.h"
+
+
+// Send a vanilla chat message as if it was from the player.
+void ChatSendMessage(unsigned int playerIndex, const char* text, bool isteam);
+
+// Send a custom message.
+//   fromPlayerIndex: set to -1 for a [SERVER] message, or another value to send from a specific player
+//   toPlayerIndex: set to -1 to send to all players, or another value to send to a single player
+//   isTeam: display a [TEAM] badge
+//   isDead: display a [DEAD] badge
+//   messageType: send a specific message type
+void ChatBroadcastMessage(
+	int fromPlayerIndex, int toPlayerIndex, const char* text, bool isTeam, bool isDead, CustomMessageType messageType);

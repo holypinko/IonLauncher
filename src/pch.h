@@ -32,7 +32,6 @@ namespace fs = std::filesystem;
 
 #include "common/pseudodefs.h"
 
-#include "core/macros.h"
 #include "mathlib/mathlib_pch.h"
 #include "mathlib/color.h"
 #include "logging/logging.h"

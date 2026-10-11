@@ -1,5 +1,5 @@
 #include "dedicated.h"
-#include "core/tier0.h"
+#include "tier0/commandline.h"
 
 DECLARE_MODULE(DedicatedMaterialSystemHooks)
 

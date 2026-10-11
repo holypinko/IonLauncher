@@ -1,7 +1,7 @@
 #pragma once
 
 #include "tier1/convar.h"
-#include "server/serverpresence.h"
+#include "engine/server/serverpresence.h"
 #include "engine/net.h"
 #include <atomic>
 #include <cstring>

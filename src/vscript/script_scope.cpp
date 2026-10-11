@@ -1,6 +1,5 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 #include "vscript/script_scope.h"
-#include "core/tier1.h"
 #include "vscript/languages/squirrel_re/squirrel.h"
 
 using ScriptScopeCreateScopeFn = HSCRIPT (*)(CSquirrelVM*, const char*);

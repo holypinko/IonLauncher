@@ -3,9 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "core/tier0.h"
+#include "tier0/platform.h"
+#include "tier0/threadtools.h"
 #include "engine/net_chan.h"
 #include "tier0/callbacks.h"
+#include "tier1/convar.h"
+#include "engine/host_state.h"
+#include "engine/client/clientstate.h"
+#include "engine/server/server_limits.h"
 
 DECLARE_MODULE(NetChanHooks)
 
@@ -212,5 +217,134 @@ ON_DLL_LOAD("engine.dll", NetChan, [](CModule module)
 	CNetChan__SendDatagram = module.Offset(0x212CD0).RCast<CNetChanSendDatagram_t>();
 	CNetChan__SetChoked = module.Offset(0x213760).RCast<CNetChanSetChoked_t>();
 
-	DISPATCH_MODULE(NetChanHooks)
+	DISPATCH_HOOK(NetChanHooks, CNetChan::ReadSubChannelData)
+})
+ConVar* Cvar_ns_log_registered_netmessages = nullptr;
+
+std::vector<std::pair<std::string, int>> g_DebugInfoRegisteredNetMessages;
+
+CNetChan__RegisterMessage_t CNetChan__RegisterMessage = nullptr;
+
+// clang-format off
+DECLARE_HOOK(CNetChan_RegisterMessage, engine.dll + 0x2129D0, [](auto& hook, CNetChan* thisptr, INetMessage* msg) -> bool
+// clang-format on
+{
+	if (hook.Original(thisptr, msg))
+	{
+		if(Cvar_ns_log_registered_netmessages && Cvar_ns_log_registered_netmessages->GetBool())
+		{
+			spdlog::info("Registered netmessage: {} (type: {}, reliable: {}, size: {})",
+				msg->GetName(),
+				msg->GetType(),
+				msg->IsReliable() ? "yes" : "no",
+				msg->GetSize());
+		}
+
+        auto it = std::find_if(g_DebugInfoRegisteredNetMessages.begin(), g_DebugInfoRegisteredNetMessages.end(),
+            [msg](const auto& pair) {
+                return pair.first == msg->GetName() && pair.second == msg->GetType();
+            });
+
+        if (it == g_DebugInfoRegisteredNetMessages.end())
+            g_DebugInfoRegisteredNetMessages.emplace_back(msg->GetName(), msg->GetType());
+
+		return true;
+	}
+
+	return false;
+})
+
+void ConCommand_ns_dump_registered_netmessages(const CCommand& args)
+{
+	spdlog::info("Dumping {} registered netmessages:", g_DebugInfoRegisteredNetMessages.size());
+
+	spdlog::info("enum NetMessageType");
+	spdlog::info("{");
+
+	int largestIndex = -1;
+
+	for (const auto& [name, type] : g_DebugInfoRegisteredNetMessages)
+	{
+		spdlog::info("    {} = {},", name, type);
+		if (type > largestIndex)
+			largestIndex = type;
+	}
+
+	spdlog::info("    __NEXT_INDEX__ = {},", largestIndex + 1);
+
+	spdlog::info("};");
+}
+// clang-format off
+DECLARE_HOOK(CNetChan::ProcessMessages, engine.dll + 0x2140A0,
+([](auto& hook, void* self, void* buf) -> char
+// clang-format on
+{
+	enum eNetChanLimitMode
+	{
+		NETCHANLIMIT_WARN,
+		NETCHANLIMIT_KICK
+	};
+
+	double startTime = g_PlatFloatTime();
+	char ret = hook.Original(self, buf);
+
+	// check processing limits, unless we're in a level transition
+	if (g_pHostState->m_iCurrentState == HostState_t::HS_RUN && ThreadInServerFrameThread())
+	{
+		// player that sent the message
+		CClient* sender = *(CClient**)((char*)self + 368);
+
+		// if no sender, return
+		// relatively certain this is fine?
+		if (!sender || !g_pServerLimits->m_PlayerLimitData.count(sender))
+			return ret;
+
+		// reset every second
+		if (startTime - g_pServerLimits->m_PlayerLimitData[sender].lastNetChanProcessingLimitStart >= 1.0 ||
+			g_pServerLimits->m_PlayerLimitData[sender].lastNetChanProcessingLimitStart == -1.0)
+		{
+			g_pServerLimits->m_PlayerLimitData[sender].lastNetChanProcessingLimitStart = startTime;
+			g_pServerLimits->m_PlayerLimitData[sender].netChanProcessingLimitTime = 0.0;
+		}
+		g_pServerLimits->m_PlayerLimitData[sender].netChanProcessingLimitTime += (g_PlatFloatTime() * 1000) - (startTime * 1000);
+
+		if (g_pServerLimits->m_PlayerLimitData[sender].netChanProcessingLimitTime >=
+			g_pServerLimits->Cvar_net_chan_limit_msec_per_sec->GetInt())
+		{
+			spdlog::warn(
+				"Client {} hit netchan processing limit with {}ms of processing time this second (max is {})",
+				(char*)sender + 0x16,
+				g_pServerLimits->m_PlayerLimitData[sender].netChanProcessingLimitTime,
+				g_pServerLimits->Cvar_net_chan_limit_msec_per_sec->GetInt());
+
+			// never kick local player
+			if (g_pServerLimits->Cvar_net_chan_limit_mode->GetInt() != NETCHANLIMIT_WARN && strcmp(g_pLocalPlayerUserID, sender->m_szPlatformID))
+			{
+				sender->Disconnect(REP_REMOVE_ONLY, "Exceeded net channel processing limit");
+				return false;
+			}
+		}
+	}
+
+	return ret;
+}))
+
+bool CNetChan::RegisterMessage(INetMessage* message)
+{
+    return CNetChan__RegisterMessage(this, message);
+}
+
+ON_DLL_LOAD_RELIESON("engine.dll", NetChanRegistration, ConVar, [](CModule module)
+{
+    DISPATCH_HOOK(NetChanHooks, CNetChan_RegisterMessage)
+    RegisterConCommand("ns_dump_registered_netmessages", ConCommand_ns_dump_registered_netmessages,
+                       "Dumps registered netmessages", FCVAR_NONE);
+    Cvar_ns_log_registered_netmessages = new ConVar("ns_log_registered_netmessages", "0", FCVAR_NONE,
+                                                   "Logs all registered netmessages to console on registration.");
+    CNetChan__RegisterMessage = module.Offset(0x2129D0).RCast<CNetChan__RegisterMessage_t>();
+})
+
+ON_DLL_LOAD_RELIESON("engine.dll", NetChanProcessingLimits, ServerLimits, [](CModule)
+{
+    DISPATCH_HOOK(NetChanHooks, CNetChan::ProcessMessages)
 })

@@ -1,7 +1,7 @@
 #include "modsystem/modinstaller.h"
 
 #include "config/profile.h"
-#include "core/tier0.h"
+#include "tier0/threadtools.h"
 #include "modsystem/modmanager.h"
 #include "modsystem/platform/modplatform.h"
 #include "modsystem/modinventory.h"

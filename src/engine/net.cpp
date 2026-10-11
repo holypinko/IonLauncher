@@ -1,5 +1,6 @@
 #include "engine/net.h"
 #include "eos/eos.h"
+#include "tier1/cvar.h"
 
 DECLARE_MODULE(NetHooks)
 
@@ -10,6 +11,8 @@ DECLARE_MODULE(NetHooks)
 //===========================================================================//
 
 double* g_pNetTime;
+int* net_error;
+static ConVar* Cvar_ns_recvfrom_per_frame_limit;
 
 char* (*GetIpStringFromClient)(int64_t a1);
 int (*NET_SendPacket)(CNetChan* pChan, int iSocket, const netadr_t* toAdr, const uint8_t* pData, unsigned int nLen, void* pVoicePayload, bool bCompress, int unMillisecondsDelay, bool bEncrypt);
@@ -361,9 +364,43 @@ DECLARE_HOOK(NET_SendPacket, engine.dll + 0x21C240,
 
 ON_DLL_LOAD("engine.dll", Net, [](CModule module)
 {
-	DISPATCH_MODULE(NetHooks)
+	DISPATCH_HOOK(NetHooks, GetIpStringFromClient)
+	DISPATCH_HOOK(NetHooks, NET_SendPacket)
 	NET_SendPacket = module.Offset(0x21C240).RCast<decltype(NET_SendPacket)>();
 	netadr_s__GetEncryptionKey = module.Offset(0x2154C0).RCast<netadr_s__GetEncryptionKey_t>();
 	g_pNetTime = module.Offset(0x13FA2DE0).RCast<double*>();
 	s_NET_BufferToBufferDecompress = module.Offset(0x219060).RCast<NETBufferToBufferDecompress_t>();
+	net_error = module.Offset(0x13FA2DD0).RCast<int*>();
+})
+// clang-format off
+DECLARE_HOOK(NET_ReceiveDatagram, engine.dll + 0x21B520, ([](auto& hook, int sock, netpacket_t* packet, bool encrypted) -> bool
+// clang-format on
+{
+	for(int i = Cvar_ns_recvfrom_per_frame_limit->GetInt(); i > 0; i--)
+	{
+		if(net_error)
+			*net_error = 0;
+
+		if (hook.Original(sock, packet, encrypted))
+			return true;
+
+		if (EOS_ReceivePacket(sock, packet))
+			return true;
+
+		if (net_error && *net_error)
+			break;
+	}
+
+	return false;
+}))
+
+ON_DLL_LOAD_RELIESON("engine.dll", DatagramReceive, Net, [](CModule)
+{
+    DISPATCH_HOOK(NetHooks, NET_ReceiveDatagram)
+})
+
+ON_DLL_LOAD_RELIESON("server.dll", DatagramReceiveLimits, ConVar, [](CModule)
+{
+    Cvar_ns_recvfrom_per_frame_limit =
+        new ConVar("ns_recvfrom_per_frame_limit", "1000", FCVAR_GAMEDLL, "Maximum number of recvfrom calls to process per frame");
 })

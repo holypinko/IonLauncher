@@ -27,7 +27,7 @@ set(launcher_libs
 foreach(target ${launcher_targets})
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE)
     target_link_libraries(${target} PRIVATE ${launcher_libs})
-    target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/include")
+    target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/src/public")
     set_target_properties(
         ${target}
         PROPERTIES LINK_FLAGS "/MANIFEST:NO /DEBUG /STACK:8000000"

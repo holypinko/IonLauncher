@@ -5,8 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
-#include "core/filesystem/filesystem.h"
-#include "core/tier0.h"
+#include "filesystem/basefilesystem.h"
+#include "modsystem/modfilesystem.h"
 #include <d3d11.h>
 #include <map>
 #include <mutex>

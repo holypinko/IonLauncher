@@ -5,7 +5,7 @@
 #include <type_traits>
 
 #include "common/qlimits.h"
-#include "engine/shared/signonstate.h"
+#include "engine/signonstate.h"
 #include "inetchannel.h"
 #include "inetmessage.h"
 #include "tier1/utlvector.h"
@@ -32,6 +32,7 @@ extern bool g_bNextServerAuthUs;
 extern bool g_bNextServerAllowingAuthUs;
 extern std::atomic_bool g_bReceivedAuthNotify;
 extern std::atomic_bool g_bReceivedServerInfo;
+extern bool g_bSendingClientSignonCapability;
 
 enum class NetMessageType : int
 {
@@ -91,10 +92,6 @@ enum class NetMessageType : int
     __NEXT_INDEX__ = 63,
 };
 
-enum class NSCustomNetMessages : int
-{
-    net_SendPersistenceChecksum = static_cast<int>(NetMessageType::__NEXT_INDEX__),
-};
 
 class CNetMessage : public INetMessage
 {

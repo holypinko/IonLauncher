@@ -67,7 +67,7 @@ jobs:
 #     - uses: actions/checkout@v4
 #     - uses: DoozyX/clang-format-lint-action@v0.20
 #       with:
-#         source: 'src include proxy dedicated'
+#         source: 'src proxy dedicated'
 #         exclude: 'src/thirdparty'
 #         extensions: 'h,cpp'
 #         clangFormatVersion: 20

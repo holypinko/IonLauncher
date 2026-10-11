@@ -1,7 +1,6 @@
 #pragma once
 
 #include "engine/net.h"
-#include "engine/r2engine.h"
 
 class CDemoFile;
 

@@ -1,7 +1,6 @@
 #include "pakstate.h"
-#include "core/tier0.h"
 #include "util/utils.h"
-#include "core/convar/concommand.h"
+#include "tier1/convar.h"
 
 PakGlobalState_s* g_pakGlobalState;
 

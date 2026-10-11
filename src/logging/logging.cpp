@@ -1,8 +1,6 @@
 #include "logging.h"
 #include "tier1/convar.h"
-#include "core/convar/concommand.h"
 #include "config/profile.h"
-#include "core/tier0.h"
 #include "util/version.h"
 #include "engine/client/clientstate.h"
 #include "dedicated/dedicated.h"

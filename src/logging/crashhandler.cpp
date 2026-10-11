@@ -674,7 +674,7 @@ void CCrashHandler::FormatException()
 
 	spdlog::error("\tAt: {} + {}", m_svCrashedModule, m_svCrashedOffset);
 	if (m_pszActiveHookName && *m_pszActiveHookName)
-		spdlog::error("\tActive hook: {}", m_pszActiveHookName);
+		spdlog::error("\tLast entered hook: {}", m_pszActiveHookName);
 }
 
 //-----------------------------------------------------------------------------

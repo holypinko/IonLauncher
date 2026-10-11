@@ -1,5 +1,5 @@
 #include "tier0/frametask.h"
-#include "core/tier0.h"
+#include "tier0/threadtools.h"
 
 CFrameTask g_TaskQueue;
 

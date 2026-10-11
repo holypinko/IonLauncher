@@ -1,9 +1,7 @@
 #include "logging.h"
 #include "tier1/convar.h"
-#include "core/convar/concommand.h"
 #include "tier1/bitbuf.h"
 #include "config/profile.h"
-#include "core/tier0.h"
 #include "vscript/languages/squirrel_re/squirrel.h"
 #include <iomanip>
 #include <sstream>

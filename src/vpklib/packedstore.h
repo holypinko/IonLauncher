@@ -289,5 +289,8 @@ static_assert(MAX_OSPATH == 260);
 static_assert(sizeof(CPackedStore) == 0x7398);
 static_assert(alignof(CPackedStore) == 8);
 
+// Called by the Filesystem module callback before binding mod filesystem originals.
+void InitialisePackedStoreFilesystemHooks();
+
 ///////////////////////////////////////////////////////////////////////////////
 #endif // PACKEDSTORE_H

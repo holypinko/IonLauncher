@@ -140,7 +140,7 @@ public:
 	std::unordered_map<std::string, std::string> RpakAliases;
 	// starpaks that this mod contains
 	// there seems to be no nice way to get the rpak that is causing the load of a starpak?
-	// hashed with STR_HASH
+	// hashed with std::hash<std::string>
 	std::vector<size_t> StarpakPaths;
 
 	std::unordered_map<std::string, std::string> DependencyConstants;

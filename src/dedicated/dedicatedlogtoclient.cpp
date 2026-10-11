@@ -1,6 +1,6 @@
 #include "dedicatedlogtoclient.h"
-#include "engine/client/client.h"
-#include "engine/r2engine.h"
+#include "engine/server/sv_client.h"
+#include "engine/server/sv_main.h"
 #include "engine/server/server.h"
 #include "tier1/cvar.h"
 

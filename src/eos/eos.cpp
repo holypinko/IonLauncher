@@ -20,11 +20,11 @@
 #include <eos_p2p.h>
 #include <eos_sdk.h>
 
-#include "core/tier0.h"
+#include "tier0/commandline.h"
+#include "tier0/platform.h"
 #include "dedicated/dedicated.h"
 #include "engine/client/clientstate.h"
 #include "engine/net.h"
-#include "engine/r2engine.h"
 #include "engine/server/server.h"
 #include "tier0/frametask.h"
 #include "tier1/cvar.h"

@@ -97,7 +97,7 @@ set(NS_VERSION_STRING
     )
 set(NS_ION_PATCH
     "0"
-    CACHE STRING "ION patch value for include/ns_version.h."
+    CACHE STRING "ION patch value for src/public/ns_version.h."
     )
 
 add_compile_definitions(
@@ -124,19 +124,19 @@ list(
 include(CPM)
 
 add_library(NorthstarIncludes INTERFACE)
-target_include_directories(NorthstarIncludes INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(NorthstarIncludes INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src/public")
 file(
     GLOB_RECURSE
     NS_PUBLIC_HEADERS
     CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/public/*.h"
     )
 target_sources(NorthstarIncludes INTERFACE "$<BUILD_INTERFACE:${NS_PUBLIC_HEADERS}>")
 
 target_precompile_headers(
     NorthstarIncludes
     INTERFACE
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/pch.h>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/public/pch.h>"
     )
 
 set(BUILD_SHARED_LIBS OFF)
